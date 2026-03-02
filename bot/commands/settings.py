@@ -13,6 +13,31 @@ class SettingsCog(commands.Cog):
 	def __init__(self, bot: commands.Bot) -> None:
 		self.bot = bot
 
+	async def cog_check(self, ctx: commands.Context) -> bool:
+		if ctx.guild is None:
+			raise commands.CheckFailure("Use this command in a server.")
+		if isinstance(ctx.author, discord.Member) and ctx.author.guild_permissions.administrator:
+			return True
+		raise commands.CheckFailure("Only server administrators can use this bot.")
+
+	async def interaction_check(self, interaction: discord.Interaction) -> bool:
+		if interaction.guild is None:
+			if interaction.response.is_done():
+				await interaction.followup.send("Use this command in a server.", ephemeral=True)
+			else:
+				await interaction.response.send_message("Use this command in a server.", ephemeral=True)
+			return False
+
+		member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
+		if isinstance(member, discord.Member) and member.guild_permissions.administrator:
+			return True
+
+		if interaction.response.is_done():
+			await interaction.followup.send("Only server administrators can use this bot.", ephemeral=True)
+		else:
+			await interaction.response.send_message("Only server administrators can use this bot.", ephemeral=True)
+		return False
+
 	@settings.command(name="announce_channel", description="Set the channel where game announcements are posted")
 	@app_commands.describe(channel="Target channel for @everyone game announcements")
 	@app_commands.default_permissions(manage_guild=True)

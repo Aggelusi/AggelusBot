@@ -13,6 +13,44 @@ class ReservationsCog(commands.Cog):
 	def __init__(self, bot: commands.Bot) -> None:
 		self.bot = bot
 
+	def _is_public_prefix_command(self, ctx: commands.Context) -> bool:
+		command_name = ctx.command.qualified_name if ctx.command else ""
+		return command_name in {"reserve", "unreserve"}
+
+	def _is_public_slash_command(self, interaction: discord.Interaction) -> bool:
+		command_name = interaction.command.name if interaction.command else ""
+		return command_name in {"reserve", "unreserve"}
+
+	async def cog_check(self, ctx: commands.Context) -> bool:
+		if ctx.guild is None:
+			raise commands.CheckFailure("Use this command in a server.")
+		if self._is_public_prefix_command(ctx):
+			return True
+		if isinstance(ctx.author, discord.Member) and ctx.author.guild_permissions.administrator:
+			return True
+		raise commands.CheckFailure("Only server administrators can use this bot.")
+
+	async def interaction_check(self, interaction: discord.Interaction) -> bool:
+		if interaction.guild is None:
+			if interaction.response.is_done():
+				await interaction.followup.send("Use this command in a server.", ephemeral=True)
+			else:
+				await interaction.response.send_message("Use this command in a server.", ephemeral=True)
+			return False
+
+		if self._is_public_slash_command(interaction):
+			return True
+
+		member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
+		if isinstance(member, discord.Member) and member.guild_permissions.administrator:
+			return True
+
+		if interaction.response.is_done():
+			await interaction.followup.send("Only server administrators can use this bot.", ephemeral=True)
+		else:
+			await interaction.response.send_message("Only server administrators can use this bot.", ephemeral=True)
+		return False
+
 	async def _safe_defer(self, interaction: discord.Interaction) -> bool:
 		"""Defer interaction safely. Returns False if interaction token is invalid."""
 		if interaction.response.is_done():
