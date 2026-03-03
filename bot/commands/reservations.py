@@ -10,6 +10,36 @@ from bot.database import db
 from bot.permissions import interaction_user_has_bot_access, member_has_bot_access
 
 
+_NATION_FULL_NAMES = {
+	"USA": "United States",
+	"UK": "United Kingdom",
+	"FRA": "France",
+	"POL": "Poland",
+	"RAJ": "British Raj",
+	"CAN": "Canada",
+	"SAF": "South Africa",
+	"AST": "Australia",
+	"BRA": "Brazil",
+	"MEX": "Mexico",
+	"NET": "Netherlands",
+	"GER": "Germany",
+	"ITA": "Italy",
+	"ROM": "Romania",
+	"HUN": "Hungary",
+	"BUL": "Bulgaria",
+	"FIN": "Finland",
+	"SPN": "Spain",
+	"YUG": "Yugoslavia",
+	"DEN": "Denmark",
+	"VICHY": "Vichy France",
+	"SOV": "Soviet Union",
+	"MON": "Mongolia",
+	"JAPAN": "Japan",
+	"MAN": "Manchukuo",
+	"SIA": "Siam",
+}
+
+
 class ReservationsCog(commands.Cog):
 	def __init__(self, bot: commands.Bot) -> None:
 		self.bot = bot
@@ -68,6 +98,18 @@ class ReservationsCog(commands.Cog):
 		if coop_match:
 			return f"{tag} coop"
 		return tag
+
+	def _reserve_choice_label(self, nation: str) -> str:
+		base = nation.split(" (Co-op", 1)[0]
+		tag = base.split()[0].upper()
+		flag = base.split(" ", 1)[1] if " " in base else ""
+		full_name = _NATION_FULL_NAMES.get(tag, tag)
+		display_base = f"{full_name} {flag}".strip()
+
+		coop_match = re.search(r"\(Co-op\s+\d+\)", nation, flags=re.IGNORECASE)
+		if coop_match:
+			return f"{display_base} {coop_match.group(0)}"
+		return display_base
 
 	def _preferences_country_list(self) -> list[str]:
 		"""Return clean country options for draft preferences.
@@ -207,16 +249,28 @@ class ReservationsCog(commands.Cog):
 			return []
 
 		available = await db.list_available_nations(int(game["id"]))
-		seen: set[str] = set()
 		choices: list[app_commands.Choice[str]] = []
+		query = current.strip().lower()
+		seen_coop_tags: set[str] = set()
 		for nation in available:
-			label = self._choice_label(nation)
-			if label in seen:
+			nation_text = str(nation)
+			base = nation_text.split(" (Co-op", 1)[0]
+			tag = base.split()[0].upper()
+			coop_match = re.search(r"\(Co-op\s+\d+\)", nation_text, flags=re.IGNORECASE)
+
+			if coop_match:
+				if tag in seen_coop_tags:
+					continue
+				seen_coop_tags.add(tag)
+				label = self._reserve_choice_label(base) + " (Co-op)"
+				value = f"{tag} coop"
+			else:
+				label = self._reserve_choice_label(nation_text)
+				value = nation_text
+
+			if query and query not in label.lower() and query not in str(nation).lower():
 				continue
-			if current.lower() not in label.lower():
-				continue
-			seen.add(label)
-			choices.append(app_commands.Choice(name=label[:100], value=label[:100]))
+			choices.append(app_commands.Choice(name=label[:100], value=value[:100]))
 		return choices[:25]
 
 	@commands.command(name="sheet_create")

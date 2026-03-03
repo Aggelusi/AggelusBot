@@ -122,6 +122,75 @@ class GamesCog(commands.Cog):
 			lines.append("**Draft:** Use `/preferences` in this thread to submit top 5 countries.")
 		return "\n".join(lines)
 
+	def _build_announcement_message_content(
+		self,
+		*,
+		title: str,
+		host_id: int,
+		manager_id: int | None,
+		manager_name: str,
+		scheduled_at: datetime,
+		mods: str,
+		description: str,
+		preset: str,
+		thread_mention: str | None,
+	) -> str:
+		announcement_text = self._build_thread_announcement_text(
+			title=title,
+			host_id=host_id,
+			manager_id=manager_id,
+			manager_name=manager_name,
+			scheduled_at=scheduled_at,
+			mods=mods,
+			description=description,
+			preset=preset,
+		)
+		if thread_mention:
+			return f"@everyone\n{announcement_text}\n\n**Info & Reserve:** {thread_mention}"
+		return f"@everyone\n{announcement_text}"
+
+	async def _refresh_announcement_message_if_exists(
+		self,
+		guild: discord.Guild,
+		game_id: int,
+	) -> None:
+		game = await db.get_game(game_id)
+		if game is None:
+			return
+
+		announce_channel_id = game["announce_channel_id"]
+		announce_message_id = game["announce_message_id"]
+		if not announce_channel_id or not announce_message_id:
+			return
+
+		channel_obj = guild.get_channel(int(announce_channel_id))
+		if not isinstance(channel_obj, discord.TextChannel):
+			return
+
+		try:
+			message = await channel_obj.fetch_message(int(announce_message_id))
+		except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+			return
+
+		thread_id = game["reservation_thread_id"]
+		thread_mention = f"<#{int(thread_id)}>" if thread_id else None
+		content = self._build_announcement_message_content(
+			title=str(game["title"]),
+			host_id=int(game["host_discord_id"]),
+			manager_id=int(game["manager_discord_id"]) if game["manager_discord_id"] else None,
+			manager_name=str(game["manager_name"] or game["host_name"]),
+			scheduled_at=game["scheduled_at"],
+			mods=str(game["mods"]),
+			description=str(game["description"]),
+			preset=str(game["preset"]),
+			thread_mention=thread_mention,
+		)
+
+		await message.edit(
+			content=content,
+			allowed_mentions=discord.AllowedMentions.none(),
+		)
+
 	async def _safe_defer(self, interaction: discord.Interaction) -> bool:
 		if interaction.response.is_done():
 			return True
@@ -481,20 +550,28 @@ class GamesCog(commands.Cog):
 				)
 				return
 
-			announcement_text = self._build_thread_announcement_text(
-				title=title,
-				host_id=host_id,
-				manager_id=manager_id,
-				manager_name=manager_name,
-				scheduled_at=scheduled_at,
-				mods=mods,
-				description=description,
-				preset=preset,
-			)
 			announcement_message: discord.Message | None = None
 
 			try:
-				announcement_message = await announce_channel.send(content=f"@everyone\n{announcement_text}")
+				announcement_message = await announce_channel.send(
+					content=self._build_announcement_message_content(
+						title=title,
+						host_id=host_id,
+						manager_id=manager_id,
+						manager_name=manager_name,
+						scheduled_at=scheduled_at,
+						mods=mods,
+						description=description,
+						preset=preset,
+						thread_mention=None,
+					),
+					allowed_mentions=discord.AllowedMentions(
+						everyone=True,
+						users=True,
+						roles=False,
+						replied_user=False,
+					),
+				)
 
 				thread = await announcement_message.create_thread(
 					name=self._build_thread_name(title),
@@ -506,7 +583,18 @@ class GamesCog(commands.Cog):
 
 				try:
 					await announcement_message.edit(
-						content=f"@everyone\n{announcement_text}\n\n**Info & Reserve:** {thread.mention}"
+						content=self._build_announcement_message_content(
+							title=title,
+							host_id=host_id,
+							manager_id=manager_id,
+							manager_name=manager_name,
+							scheduled_at=scheduled_at,
+							mods=mods,
+							description=description,
+							preset=preset,
+							thread_mention=thread.mention,
+						),
+						allowed_mentions=discord.AllowedMentions.none(),
 					)
 				except (discord.Forbidden, discord.HTTPException):
 					pass
@@ -651,11 +739,14 @@ class GamesCog(commands.Cog):
 			"**Things that happened:**",
 			notable_events_display or "-",
 		]
+		base_log_content = "\n".join(log_lines)
+
+		log_with_links_lines = list(log_lines)
 		if save_game is not None:
-			log_lines.append(f"**Save Game:** {save_game.url}")
+			log_with_links_lines.append(f"**Save Game:** {save_game.url}")
 		if map_screenshot is not None:
-			log_lines.append(f"**Map Screenshot:** {map_screenshot.url}")
-		log_content = "\n".join(log_lines)
+			log_with_links_lines.append(f"**Map Screenshot:** {map_screenshot.url}")
+		log_content_with_links = "\n".join(log_with_links_lines)
 
 		files: list[discord.File] = []
 		if save_game is not None:
@@ -666,16 +757,16 @@ class GamesCog(commands.Cog):
 		attachments_warning: str | None = None
 		if files:
 			try:
-				await log_channel.send(content=log_content, files=files)
+				await log_channel.send(content=base_log_content, files=files)
 			except (discord.Forbidden, discord.HTTPException):
 				# Fallback: still log the result with attachment URLs in plain text.
-				await log_channel.send(content=log_content)
+				await log_channel.send(content=log_content_with_links)
 				attachments_warning = (
 					"Files could not be re-uploaded to the log channel (size/permission limit). "
 					"I logged links to the original attachments instead."
 				)
 		else:
-			await log_channel.send(content=log_content)
+			await log_channel.send(content=log_content_with_links)
 
 		if str(game["preset"]) == "no_sheet":
 			pref_rows = await db.list_game_preferences(game_id)
@@ -903,6 +994,7 @@ class GamesCog(commands.Cog):
 				changes.append(f"removed nation {resolved_remove}")
 
 		await self._refresh_sheet_message_if_exists(game_id)
+		await self._refresh_announcement_message_if_exists(interaction.guild, game_id)
 
 		if not changes:
 			await interaction.followup.send("No changes were applied.", ephemeral=True)
