@@ -726,6 +726,20 @@ async def get_major_lock_role(guild_id: int) -> int | None:
 		return None
 
 
+async def set_bot_access_role(guild_id: int, role_id: int) -> None:
+	await set_guild_setting(guild_id, "bot_access_role_id", str(role_id))
+
+
+async def get_bot_access_role(guild_id: int) -> int | None:
+	value = await get_guild_setting(guild_id, "bot_access_role_id")
+	if value is None:
+		return None
+	try:
+		return int(value)
+	except ValueError:
+		return None
+
+
 async def set_admin_notify_channel(guild_id: int, channel_id: int) -> None:
 	await set_guild_setting(guild_id, "admin_notify_channel_id", str(channel_id))
 

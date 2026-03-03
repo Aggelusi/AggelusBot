@@ -4,6 +4,7 @@ import discord
 from discord.ext import commands
 
 from bot.database import db
+from bot.permissions import member_has_bot_access
 
 
 class PingCog(commands.Cog):
@@ -13,9 +14,9 @@ class PingCog(commands.Cog):
     async def cog_check(self, ctx: commands.Context) -> bool:
         if ctx.guild is None:
             raise commands.CheckFailure("Use this command in a server.")
-        if isinstance(ctx.author, discord.Member) and ctx.author.guild_permissions.administrator:
+        if isinstance(ctx.author, discord.Member) and await member_has_bot_access(ctx.author):
             return True
-        raise commands.CheckFailure("Only server administrators can use this bot.")
+        raise commands.CheckFailure("Only server administrators or members with the bot access role can use this bot.")
 
     @commands.command(name="ping")
     async def ping(self, ctx: commands.Context) -> None:

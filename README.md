@@ -46,8 +46,10 @@ Start from project root with Python module mode so imports work:
 
 1. Set announcement channel (admin):
 	- `/settings announce_channel`
-2. Announce and create game in one step:
+2. (Optional) Allow a non-admin role to run restricted bot commands:
+	- `/settings bot_access_role`
+3. Announce and create game in one step:
 	- `/game announce`
-3. Reserve nations:
+4. Reserve nations:
 	- `/reserve`
 	- `/unreserve`
