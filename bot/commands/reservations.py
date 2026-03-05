@@ -102,9 +102,8 @@ class ReservationsCog(commands.Cog):
 	def _reserve_choice_label(self, nation: str) -> str:
 		base = nation.split(" (Co-op", 1)[0]
 		tag = base.split()[0].upper()
-		flag = base.split(" ", 1)[1] if " " in base else ""
 		full_name = _NATION_FULL_NAMES.get(tag, tag)
-		display_base = f"{full_name} {flag}".strip()
+		display_base = full_name
 
 		coop_match = re.search(r"\(Co-op\s+\d+\)", nation, flags=re.IGNORECASE)
 		if coop_match:
