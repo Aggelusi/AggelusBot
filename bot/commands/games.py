@@ -119,7 +119,7 @@ class GamesCog(commands.Cog):
 		if preset != "no_sheet":
 			lines.append("**Reserve:** Use `/reserve` and `/unreserve` in this thread.")
 		else:
-			lines.append("**Draft:** Use `/preferences` in this thread to submit top 5 countries.")
+			lines.append("**Draft:** Use `/draft_join`, `/draft_vote`, `/draft_start`, `/draft_decide`, `/draft_pick`, and `/draft_assign` in this thread.")
 		return "\n".join(lines)
 
 	def _build_announcement_message_content(
@@ -311,11 +311,17 @@ class GamesCog(commands.Cog):
 		if interaction.guild is None:
 			return []
 
-		rows = await db.list_guild_games(interaction.guild.id, limit=25)
+		try:
+			rows = await db.list_guild_games(interaction.guild.id, limit=25)
+		except Exception:
+			logging.exception("game_autocomplete failed for guild_id=%s", interaction.guild.id)
+			return []
+
 		choices: list[app_commands.Choice[str]] = []
+		query = current.lower().strip()
 		for row in rows:
 			label = f"{row['title']} (#{row['id']})"
-			if current.lower() in label.lower():
+			if not query or query in label.lower():
 				choices.append(app_commands.Choice(name=label[:100], value=str(row["id"])))
 		return choices[:25]
 
@@ -522,18 +528,17 @@ class GamesCog(commands.Cog):
 				mods=mods,
 				description=description,
 			)
-			if preset != "no_sheet":
-				await db.create_reservation_sheet(
-					game_id,
-					coop_overrides={
-						"usa": int(usa_coops),
-						"uk": int(uk_coops),
-						"ger": int(ger_coops),
-						"ita": int(ita_coops),
-						"sov": int(sov_coops),
-						"japan": int(japan_coops),
-					},
-				)
+			await db.create_reservation_sheet(
+				game_id,
+				coop_overrides={
+					"usa": int(usa_coops),
+					"uk": int(uk_coops),
+					"ger": int(ger_coops),
+					"ita": int(ita_coops),
+					"sov": int(sov_coops),
+					"japan": int(japan_coops),
+				},
+			)
 
 			announce_channel_id = await db.get_announce_channel(interaction.guild.id)
 			announce_channel = None
@@ -605,16 +610,32 @@ class GamesCog(commands.Cog):
 					sheet_message = await thread.send("\n".join(sheet_lines))
 					await db.set_game_reservation_sheet_message(game_id, sheet_message.id)
 				else:
+					rows = await db.list_sheet(game_id)
+					sheet_lines = db.build_sheet_display_lines(title, rows)
 					pref_lines = [
-						f"## Draft Preferences — {title}",
+						f"## Draft Board — {title}",
 						"",
-						"No preferences submitted yet.",
+						"Draft status: Setup",
+						"Next pick: not started",
 						"",
-						"Use `/preferences` to submit your top 5 countries.",
+						"### Not Picked",
+						"- none",
+						"",
+						"### Allies",
+						"- none",
+						"",
+						"### Axis",
+						"- none",
+						"",
+						"---",
+						"",
+						*sheet_lines,
+						"",
+						"Use `/draft_join` to enter pool with role/captain options, `/draft_vote` to vote captains, `/draft_start` to begin, `/draft_decide` for captain decision, `/draft_pick` for picks, and `/draft_assign` for nation assignment.",
 					]
 					pref_message = await thread.send("\n".join(pref_lines))
 					try:
-						await pref_message.pin(reason="Keep draft preferences visible")
+						await pref_message.pin(reason="Keep draft board visible")
 					except (discord.Forbidden, discord.HTTPException):
 						pass
 					await db.set_game_reservation_sheet_message(game_id, pref_message.id)
@@ -689,16 +710,16 @@ class GamesCog(commands.Cog):
 			await interaction.followup.send("Use this command in a server.", ephemeral=True)
 			return
 
-		game = await db.get_game(game_id)
-		if game is None:
+		game_row = await db.get_game(game_id)
+		if game_row is None:
 			await interaction.followup.send(f"Game with ID {game_id} was not found.", ephemeral=True)
 			return
 
-		if int(game["guild_id"]) != int(interaction.guild.id):
+		if int(game_row["guild_id"]) != int(interaction.guild.id):
 			await interaction.followup.send("This game belongs to a different server.", ephemeral=True)
 			return
 
-		is_host = int(game["host_discord_id"]) == int(interaction.user.id)
+		is_host = int(game_row["host_discord_id"]) == int(interaction.user.id)
 		can_manage_guild = False
 		if isinstance(interaction.user, discord.Member):
 			can_manage_guild = interaction.user.guild_permissions.manage_guild
@@ -725,15 +746,15 @@ class GamesCog(commands.Cog):
 		notable_events_display = self._expand_escaped_newlines(notable_events)
 
 		log_lines = [
-			f"__**Game Closed: {game['title']}**__",
+			f"__**Game Closed: {game_row['title']}**__",
 			f"**Winner:** {winner.value}",
 			f"**Game ID:** {game_id}",
-			f"**Host:** {self._format_user_mention(game['host_discord_id'], game['host_name'])}",
+			f"**Host:** {self._format_user_mention(game_row['host_discord_id'], game_row['host_name'])}",
 			(
 				"**Manager:** "
-				f"{self._format_user_mention(game['manager_discord_id'], game['manager_name'] or game['host_name'])}"
+				f"{self._format_user_mention(game_row['manager_discord_id'], game_row['manager_name'] or game_row['host_name'])}"
 			),
-			f"**Game Date:** {self._display_date(game['scheduled_at'])}",
+			f"**Game Date:** {self._display_date(game_row['scheduled_at'])}",
 			f"**End Year:** {end_year}",
 			f"**Closed By:** {interaction.user.mention}",
 			"**Things that happened:**",
@@ -768,29 +789,20 @@ class GamesCog(commands.Cog):
 		else:
 			await log_channel.send(content=log_content_with_links)
 
-		if str(game["preset"]) == "no_sheet":
-			pref_rows = await db.list_game_preferences(game_id)
-			sheet_lines = [f"## Draft Preferences — {game['title']}", ""]
-			if not pref_rows:
-				sheet_lines.append("No preferences submitted yet.")
-			else:
-				for row in pref_rows:
-					sheet_lines.append(f"<@{int(row['user_id'])}>: {', '.join(row['choices'])}")
-		else:
-			rows = await db.list_sheet(game_id)
-			sheet_lines = db.build_sheet_display_lines(str(game["title"]), rows)
+		rows = await db.list_sheet(game_id)
+		sheet_lines = db.build_sheet_display_lines(str(game_row["title"]), rows)
 
 		reservation_sheet_snapshot = "\n".join(sheet_lines)
 
-		announce_channel_id = game["announce_channel_id"]
-		announce_message_id = game["announce_message_id"]
+		announce_channel_id = game_row["announce_channel_id"]
+		announce_message_id = game_row["announce_message_id"]
 
 		# Delete thread first so cleanup doesn't depend on announcement message state.
 		await self._delete_thread_if_exists(
 			interaction.guild,
-			game["reservation_thread_id"],
+			game_row["reservation_thread_id"],
 			announce_channel_id,
-			str(game["title"]),
+			str(game_row["title"]),
 		)
 
 		if announce_channel_id and announce_message_id:
@@ -803,9 +815,9 @@ class GamesCog(commands.Cog):
 					pass
 
 		await db.create_game_result(
-			guild_id=int(game["guild_id"]),
+			guild_id=int(game_row["guild_id"]),
 			game_id=game_id,
-			game_date=game["scheduled_at"],
+			game_date=game_row["scheduled_at"],
 			winning_side=winner.value,
 			reservation_sheet=reservation_sheet_snapshot,
 		)
@@ -835,16 +847,16 @@ class GamesCog(commands.Cog):
 			await interaction.followup.send("Use this command in a server.", ephemeral=True)
 			return
 
-		game = await db.get_game(game_id)
-		if game is None:
+		game_row = await db.get_game(game_id)
+		if game_row is None:
 			await interaction.followup.send(f"Game with ID {game_id} was not found.", ephemeral=True)
 			return
 
-		if int(game["guild_id"]) != int(interaction.guild.id):
+		if int(game_row["guild_id"]) != int(interaction.guild.id):
 			await interaction.followup.send("This game belongs to a different server.", ephemeral=True)
 			return
 
-		is_host = int(game["host_discord_id"]) == int(interaction.user.id)
+		is_host = int(game_row["host_discord_id"]) == int(interaction.user.id)
 		can_manage_guild = False
 		if isinstance(interaction.user, discord.Member):
 			can_manage_guild = interaction.user.guild_permissions.manage_guild
@@ -860,34 +872,34 @@ class GamesCog(commands.Cog):
 		log_channel = interaction.guild.get_channel(log_channel_id) if log_channel_id else None
 		if isinstance(log_channel, discord.TextChannel):
 			embed = discord.Embed(
-				title=f"Game Cancelled: {game['title']}",
+				title=f"Game Cancelled: {game_row['title']}",
 				description=reason or "No reason provided.",
 				color=discord.Color.orange(),
 			)
 			embed.add_field(name="Game ID", value=str(game_id), inline=True)
 			embed.add_field(
 				name="Host",
-				value=self._format_user_mention(game["host_discord_id"], game["host_name"]),
+				value=self._format_user_mention(game_row["host_discord_id"], game_row["host_name"]),
 				inline=True,
 			)
 			embed.add_field(
 				name="Manager",
-				value=self._format_user_mention(game["manager_discord_id"], game["manager_name"] or game["host_name"]),
+				value=self._format_user_mention(game_row["manager_discord_id"], game_row["manager_name"] or game_row["host_name"]),
 				inline=True,
 			)
-			embed.add_field(name="Planned Date", value=self._display_date(game["scheduled_at"]), inline=True)
+			embed.add_field(name="Planned Date", value=self._display_date(game_row["scheduled_at"]), inline=True)
 			embed.add_field(name="Cancelled By", value=interaction.user.mention, inline=True)
 			await log_channel.send(embed=embed)
 
-		announce_channel_id = game["announce_channel_id"]
-		announce_message_id = game["announce_message_id"]
+		announce_channel_id = game_row["announce_channel_id"]
+		announce_message_id = game_row["announce_message_id"]
 
 		# Delete thread first so cleanup doesn't depend on announcement message state.
 		await self._delete_thread_if_exists(
 			interaction.guild,
-			game["reservation_thread_id"],
+			game_row["reservation_thread_id"],
 			announce_channel_id,
-			str(game["title"]),
+			str(game_row["title"]),
 		)
 
 		if announce_channel_id and announce_message_id:
@@ -912,7 +924,7 @@ class GamesCog(commands.Cog):
 		time="New time HH:MM (optional)",
 		reserve_nation="Nation to force-reserve for a player",
 		reserve_player="Player to assign to nation",
-		unreserve_nation="Nation to clear reservation",
+		unreserve_tag="Player mention or player ID to clear reservation(s)",
 		add_country="Add country/nation to sheet",
 		remove_country="Remove country/nation from sheet",
 	)
@@ -924,7 +936,7 @@ class GamesCog(commands.Cog):
 		time: str | None = None,
 		reserve_nation: str | None = None,
 		reserve_player: discord.Member | None = None,
-		unreserve_nation: str | None = None,
+		unreserve_tag: str | None = None,
 		add_country: str | None = None,
 		remove_country: str | None = None,
 	) -> None:
@@ -976,13 +988,67 @@ class GamesCog(commands.Cog):
 			if await db.admin_set_reservation(game_id, resolved, reserve_player.id, reserve_player.display_name):
 				changes.append(f"reserved {resolved} for {reserve_player.mention}")
 
-		if unreserve_nation:
-			resolved_unres = await db.resolve_nation_name(game_id, unreserve_nation)
-			if resolved_unres is None:
-				await interaction.followup.send("Unreserve nation not found in sheet.", ephemeral=True)
+		if unreserve_tag:
+			member_id: int | None = None
+			mention_match = re.fullmatch(r"<@!?(\d+)>", unreserve_tag.strip())
+			if mention_match:
+				member_id = int(mention_match.group(1))
+			else:
+				try:
+					member_id = int(unreserve_tag.strip())
+				except ValueError:
+					member_id = None
+
+			if member_id is None and interaction.guild is not None:
+				query_name = unreserve_tag.strip().lstrip("@").lower()
+				matched_member = discord.utils.find(
+					lambda m: (
+						m.display_name.lower() == query_name
+						or m.name.lower() == query_name
+						or (m.global_name is not None and m.global_name.lower() == query_name)
+					),
+					interaction.guild.members,
+				)
+				if matched_member is not None:
+					member_id = int(matched_member.id)
+
+			if member_id is None:
+				await interaction.followup.send(
+					"Unreserve target must be a player mention, player ID, or exact username/display name.",
+					ephemeral=True,
+				)
 				return
-			if await db.admin_clear_reservation(game_id, resolved_unres):
-				changes.append(f"unreserved {resolved_unres}")
+
+			rows = await db.get_user_reserved_nations(game_id, member_id)
+			cleared: list[str] = []
+			for row in rows:
+				nation_name = str(row["nation_name"])
+				if await db.admin_clear_reservation(game_id, nation_name):
+					cleared.append(nation_name)
+
+			moved_to_unpicked = False
+			removed_from_pool = False
+			if str(game_row["preset"]) == "no_sheet":
+				draft_player = await db.get_draft_player(game_id, member_id)
+				if draft_player is not None and not bool(draft_player["is_captain"]):
+					if str(draft_player["side"]) != "unpicked":
+						moved_to_unpicked = await db.admin_move_draft_player_to_unpicked(game_id, member_id)
+					else:
+						removed_from_pool = await db.draft_leave_player(game_id, member_id)
+
+			if not cleared and not moved_to_unpicked and not removed_from_pool:
+				await interaction.followup.send(
+					"No reservations or draft picks found for that player.",
+					ephemeral=True,
+				)
+				return
+
+			if cleared:
+				changes.append(f"unreserved {', '.join(cleared)} for <@{member_id}>")
+			if moved_to_unpicked:
+				changes.append(f"moved <@{member_id}> back to Not Picked")
+			if removed_from_pool:
+				changes.append(f"removed <@{member_id}> from draft pool")
 
 		if add_country:
 			if await db.add_nation_to_sheet(game_id, add_country.strip()):
