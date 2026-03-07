@@ -20,6 +20,25 @@ DEFAULT_MAJOR_COOPS = {
 
 GAME_PRESETS = {"normal", "small", "noob", "no_sheet"}
 
+DRAFT_SLOT_TYPES = {
+	"player": "Player",
+	"major": "Major",
+	"minor": "Minor",
+	"coop": "Coop",
+	"fill": "Fill",
+	"late_hotjoin": "Late Hotjoin",
+}
+
+DRAFT_PHASES = {
+	"lobby",
+	"choice_pending",
+	"side_pending",
+	"drafting",
+	"ban_pending",
+	"assigning",
+	"complete",
+}
+
 _MAJOR_NATION_LABELS = {
 	"usa": "USA 🇺🇸",
 	"uk": "UK 🇬🇧",
@@ -75,6 +94,7 @@ _FACTION_BY_TAG = {
 	"JAPAN": "GEACPS",
 	"MAN": "GEACPS",
 	"SIA": "GEACPS",
+	"FILL": "Other",
 }
 
 
@@ -120,6 +140,9 @@ def build_nation_pool(coop_overrides: dict[str, int] | None = None) -> list[str]
 		_MAJOR_NATION_LABELS["japan"],
 		"MAN 🇨🇳",
 		"SIA 🇹🇭",
+
+		# Other
+		"FILL",
 	]
 
 	for key, nation_label in _MAJOR_NATION_LABELS.items():
@@ -360,36 +383,13 @@ async def init_schema() -> None:
 
 	await execute(
 		"""
-		CREATE TABLE IF NOT EXISTS game_draft_state (
-			game_id INTEGER PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,
-			allies_captain_id BIGINT,
-			allies_captain_name TEXT NOT NULL DEFAULT '',
-			axis_captain_id BIGINT,
-			axis_captain_name TEXT NOT NULL DEFAULT '',
-			team_decider_id BIGINT,
-			team_decider_name TEXT NOT NULL DEFAULT '',
-			pending_side_choice_captain_id BIGINT,
-			first_pick_captain_id BIGINT,
-			next_turn TEXT NOT NULL DEFAULT 'allies',
-			status TEXT NOT NULL DEFAULT 'setup',
-			board_message_id BIGINT,
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)
-		"""
-	)
-
-	await execute(
-		"""
-		CREATE TABLE IF NOT EXISTS game_draft_players (
+		CREATE TABLE IF NOT EXISTS draft_reservations (
 			id SERIAL PRIMARY KEY,
 			game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
 			user_id BIGINT NOT NULL,
 			user_name TEXT NOT NULL,
-			role_preference TEXT NOT NULL DEFAULT 'fill',
-			up_for_captain BOOLEAN NOT NULL DEFAULT FALSE,
-			side TEXT NOT NULL DEFAULT 'unpicked',
-			is_captain BOOLEAN NOT NULL DEFAULT FALSE,
-			picked_at TIMESTAMPTZ,
+			slot_type TEXT NOT NULL,
+			captain_candidate BOOLEAN NOT NULL DEFAULT FALSE,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			UNIQUE (game_id, user_id)
 		)
@@ -398,38 +398,82 @@ async def init_schema() -> None:
 
 	await execute(
 		"""
-		CREATE TABLE IF NOT EXISTS game_draft_votes (
+		CREATE TABLE IF NOT EXISTS draft_captain_votes (
 			id SERIAL PRIMARY KEY,
 			game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-			voter_id BIGINT NOT NULL,
-			voter_name TEXT NOT NULL,
+			voter_user_id BIGINT NOT NULL,
 			candidate_user_id BIGINT NOT NULL,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			UNIQUE (game_id, voter_id),
-			UNIQUE (game_id, voter_id, candidate_user_id),
-			FOREIGN KEY (game_id, candidate_user_id)
-				REFERENCES game_draft_players (game_id, user_id)
-				ON DELETE CASCADE
+			UNIQUE (game_id, voter_user_id)
+		)
+		"""
+	)
+	await execute(
+		"""
+		DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1
+				FROM pg_constraint
+				WHERE conname = 'draft_captain_votes_game_id_voter_user_id_key'
+			) THEN
+				ALTER TABLE draft_captain_votes
+				DROP CONSTRAINT draft_captain_votes_game_id_voter_user_id_key;
+			END IF;
+		END $$;
+		"""
+	)
+	await execute(
+		"""
+		CREATE UNIQUE INDEX IF NOT EXISTS ux_draft_captain_votes_triplet
+		ON draft_captain_votes (game_id, voter_user_id, candidate_user_id)
+		"""
+	)
+
+	await execute(
+		"""
+		CREATE TABLE IF NOT EXISTS draft_states (
+			game_id INTEGER PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,
+			phase TEXT NOT NULL DEFAULT 'lobby',
+			coin_winner_user_id BIGINT,
+			allies_captain_user_id BIGINT,
+			axis_captain_user_id BIGINT,
+			starting_picker_user_id BIGINT,
+			next_picker_user_id BIGINT,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)
 		"""
 	)
 
 	await execute(
-		"ALTER TABLE game_draft_players ADD COLUMN IF NOT EXISTS role_preference TEXT NOT NULL DEFAULT 'fill'"
+		"""
+		CREATE TABLE IF NOT EXISTS draft_team_assignments (
+			id SERIAL PRIMARY KEY,
+			game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+			user_id BIGINT NOT NULL,
+			user_name TEXT NOT NULL,
+			team_side TEXT NOT NULL,
+			picked_by_user_id BIGINT NOT NULL,
+			pick_number INTEGER NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (game_id, user_id)
+		)
+		"""
 	)
+
 	await execute(
-		"ALTER TABLE game_draft_players ADD COLUMN IF NOT EXISTS up_for_captain BOOLEAN NOT NULL DEFAULT FALSE"
-	)
-	await execute("ALTER TABLE game_draft_state ADD COLUMN IF NOT EXISTS team_decider_id BIGINT")
-	await execute(
-		"ALTER TABLE game_draft_state ADD COLUMN IF NOT EXISTS team_decider_name TEXT NOT NULL DEFAULT ''"
-	)
-	await execute(
-		"ALTER TABLE game_draft_state ADD COLUMN IF NOT EXISTS pending_side_choice_captain_id BIGINT"
-	)
-	await execute(
-		"ALTER TABLE game_draft_state ADD COLUMN IF NOT EXISTS first_pick_captain_id BIGINT"
+		"""
+		CREATE TABLE IF NOT EXISTS draft_player_bans (
+			id SERIAL PRIMARY KEY,
+			game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+			captain_user_id BIGINT NOT NULL,
+			target_user_id BIGINT NOT NULL,
+			nation_tag TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (game_id, captain_user_id),
+			UNIQUE (game_id, target_user_id, nation_tag)
+		)
+		"""
 	)
 
 	await execute(
@@ -859,6 +903,34 @@ async def create_reservation_sheet(game_id: int, coop_overrides: dict[str, int] 
 	return inserted
 
 
+async def create_reservation_sheet_for_preset(
+	game_id: int,
+	preset: str,
+	coop_overrides: dict[str, int] | None = None,
+) -> int:
+	"""Create a sheet using a specific preset regardless of game preset."""
+	pool = get_pool()
+	inserted = 0
+	nations = build_nation_pool_for_preset(preset, coop_overrides)
+
+	async with pool.acquire() as conn:
+		async with conn.transaction():
+			for nation in nations:
+				result = await conn.execute(
+					"""
+					INSERT INTO game_nations (game_id, nation_name)
+					VALUES ($1, $2)
+					ON CONFLICT (game_id, nation_name) DO NOTHING
+					""",
+					game_id,
+					nation,
+				)
+				if _status_affected_rows(result) == 1:
+					inserted += 1
+
+	return inserted
+
+
 async def add_nation_to_sheet(game_id: int, nation_name: str) -> bool:
 	result = await execute(
 		"""
@@ -1097,107 +1169,12 @@ async def list_game_preferences(game_id: int) -> list[asyncpg.Record]:
 	)
 
 
-async def draft_join_player(
-	game_id: int,
-	user_id: int,
-	user_name: str,
-	role_preference: str = "fill",
-	up_for_captain: bool = False,
-) -> None:
-	"""Add or refresh a player in the draft pool for a game."""
-	await execute(
-		"""
-		INSERT INTO game_draft_players (game_id, user_id, user_name, role_preference, up_for_captain)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (game_id, user_id)
-		DO UPDATE SET
-			user_name = EXCLUDED.user_name,
-			role_preference = EXCLUDED.role_preference,
-			up_for_captain = EXCLUDED.up_for_captain,
-			updated_at = NOW()
-		""",
-		game_id,
-		user_id,
-		user_name,
-		role_preference,
-		up_for_captain,
-	)
-
-
-async def draft_leave_player(game_id: int, user_id: int) -> bool:
-	"""Remove a player from draft pool only if they have not been picked yet."""
-	result = await execute(
-		"""
-		DELETE FROM game_draft_players
-		WHERE game_id = $1 AND user_id = $2 AND side = 'unpicked' AND is_captain = FALSE
-		""",
-		game_id,
-		user_id,
-	)
-	return _status_affected_rows(result) == 1
-
-
-async def get_draft_state(game_id: int) -> asyncpg.Record | None:
+async def get_game_preferences_for_user(game_id: int, user_id: int) -> asyncpg.Record | None:
+	"""Return one player's submitted preferences for a no-sheet game."""
 	return await fetchrow(
 		"""
-		SELECT
-			game_id,
-			allies_captain_id,
-			allies_captain_name,
-			axis_captain_id,
-			axis_captain_name,
-			team_decider_id,
-			team_decider_name,
-			pending_side_choice_captain_id,
-			first_pick_captain_id,
-			next_turn,
-			status,
-			board_message_id,
-			updated_at
-		FROM game_draft_state
-		WHERE game_id = $1
-		""",
-		game_id,
-	)
-
-
-async def list_draft_players(game_id: int) -> list[asyncpg.Record]:
-	return await fetch(
-		"""
-		SELECT user_id, user_name, role_preference, up_for_captain, side, is_captain, picked_at, updated_at
-		FROM game_draft_players
-		WHERE game_id = $1
-		ORDER BY
-			CASE side
-				WHEN 'allies' THEN 1
-				WHEN 'axis' THEN 2
-				ELSE 3
-			END,
-			is_captain DESC,
-			COALESCE(picked_at, updated_at) ASC
-		""",
-		game_id,
-	)
-
-
-async def list_draft_players_by_side(game_id: int, side: str) -> list[asyncpg.Record]:
-	return await fetch(
-		"""
-		SELECT user_id, user_name, role_preference, up_for_captain, side, is_captain, picked_at, updated_at
-		FROM game_draft_players
-		WHERE game_id = $1 AND side = $2
-		ORDER BY is_captain DESC, COALESCE(picked_at, updated_at) ASC
-		""",
-		game_id,
-		side,
-	)
-
-
-async def get_draft_player(game_id: int, user_id: int) -> asyncpg.Record | None:
-	return await fetchrow(
-		"""
-		SELECT user_id, user_name, role_preference, up_for_captain, side, is_captain, picked_at, updated_at
-		FROM game_draft_players
+		SELECT user_id, user_name, choices, updated_at
+		FROM game_preferences
 		WHERE game_id = $1 AND user_id = $2
 		""",
 		game_id,
@@ -1205,279 +1182,104 @@ async def get_draft_player(game_id: int, user_id: int) -> asyncpg.Record | None:
 	)
 
 
-async def initialize_draft_captain_decision(
-	game_id: int,
-	captain_a_id: int,
-	captain_a_name: str,
-	captain_b_id: int,
-	captain_b_name: str,
-	team_decider_id: int,
-	team_decider_name: str,
-) -> None:
-	"""Initialize captain decision phase before team side assignment."""
-	pool = get_pool()
-	async with pool.acquire() as conn:
-		async with conn.transaction():
-			await conn.execute(
-				"""
-				UPDATE game_draft_players
-				SET side = 'unpicked', is_captain = FALSE, picked_at = NULL, updated_at = NOW()
-				WHERE game_id = $1
-				""",
-				game_id,
-			)
-
-			await conn.execute(
-				"""
-				INSERT INTO game_draft_players (game_id, user_id, user_name, side, is_captain, picked_at)
-				VALUES ($1, $2, $3, 'captain', TRUE, NOW())
-				ON CONFLICT (game_id, user_id)
-				DO UPDATE SET
-					user_name = EXCLUDED.user_name,
-					side = 'captain',
-					is_captain = TRUE,
-					picked_at = NOW(),
-					updated_at = NOW()
-				""",
-				game_id,
-				captain_a_id,
-				captain_a_name,
-			)
-
-			await conn.execute(
-				"""
-				INSERT INTO game_draft_players (game_id, user_id, user_name, side, is_captain, picked_at)
-				VALUES ($1, $2, $3, 'captain', TRUE, NOW())
-				ON CONFLICT (game_id, user_id)
-				DO UPDATE SET
-					user_name = EXCLUDED.user_name,
-					side = 'captain',
-					is_captain = TRUE,
-					picked_at = NOW(),
-					updated_at = NOW()
-				""",
-				game_id,
-				captain_b_id,
-				captain_b_name,
-			)
-
-			await conn.execute(
-				"""
-				INSERT INTO game_draft_state (
-					game_id,
-					allies_captain_id,
-					allies_captain_name,
-					axis_captain_id,
-					axis_captain_name,
-					team_decider_id,
-					team_decider_name,
-					pending_side_choice_captain_id,
-					first_pick_captain_id,
-					next_turn,
-					status,
-					updated_at
-				)
-				VALUES ($1, NULL, '', NULL, '', $2, $3, NULL, NULL, 'none', 'captain_decision', NOW())
-				ON CONFLICT (game_id)
-				DO UPDATE SET
-					allies_captain_id = NULL,
-					allies_captain_name = '',
-					axis_captain_id = NULL,
-					axis_captain_name = '',
-					team_decider_id = EXCLUDED.team_decider_id,
-					team_decider_name = EXCLUDED.team_decider_name,
-					pending_side_choice_captain_id = NULL,
-					first_pick_captain_id = NULL,
-					next_turn = 'none',
-					status = 'captain_decision',
-					updated_at = NOW()
-				""",
-				game_id,
-				team_decider_id,
-				team_decider_name,
-			)
+def normalize_draft_slot_type(slot_type: str) -> str | None:
+	cleaned = re.sub(r"[^a-z]+", "_", slot_type.strip().lower())
+	cleaned = cleaned.strip("_")
+	aliases = {
+		"default": "player",
+		"regular": "player",
+		"hotjoin": "late_hotjoin",
+		"latehotjoin": "late_hotjoin",
+		"late_hot_join": "late_hotjoin",
+		"co_op": "coop",
+	}
+	normalized = aliases.get(cleaned, cleaned)
+	if normalized in DRAFT_SLOT_TYPES:
+		return normalized
+	return None
 
 
-async def set_draft_first_pick_choice(game_id: int, first_pick_captain_id: int, pending_side_choice_captain_id: int) -> None:
-	await execute(
+def draft_slot_label(slot_type: str) -> str:
+	return DRAFT_SLOT_TYPES.get(slot_type, slot_type.title())
+
+
+async def get_draft_reservation(game_id: int, user_id: int) -> asyncpg.Record | None:
+	return await fetchrow(
 		"""
-		UPDATE game_draft_state
-		SET
-			first_pick_captain_id = $2,
-			pending_side_choice_captain_id = $3,
-			status = 'pending_side_choice',
-			updated_at = NOW()
-		WHERE game_id = $1
+		SELECT game_id, user_id, user_name, slot_type, captain_candidate, updated_at
+		FROM draft_reservations
+		WHERE game_id = $1 AND user_id = $2
 		""",
 		game_id,
-		first_pick_captain_id,
-		pending_side_choice_captain_id,
+		user_id,
 	)
 
 
-async def finalize_draft_sides(
-	game_id: int,
-	allies_captain_id: int,
-	allies_captain_name: str,
-	axis_captain_id: int,
-	axis_captain_name: str,
-	first_pick_captain_id: int,
-) -> None:
-	pool = get_pool()
-	async with pool.acquire() as conn:
-		async with conn.transaction():
-			await conn.execute(
-				"""
-				UPDATE game_draft_players
-				SET side = 'allies', picked_at = NOW(), updated_at = NOW()
-				WHERE game_id = $1 AND user_id = $2 AND is_captain = TRUE
-				""",
-				game_id,
-				allies_captain_id,
-			)
-
-			await conn.execute(
-				"""
-				UPDATE game_draft_players
-				SET side = 'axis', picked_at = NOW(), updated_at = NOW()
-				WHERE game_id = $1 AND user_id = $2 AND is_captain = TRUE
-				""",
-				game_id,
-				axis_captain_id,
-			)
-
-			first_pick_side = "allies" if int(first_pick_captain_id) == int(allies_captain_id) else "axis"
-			await conn.execute(
-				"""
-				UPDATE game_draft_state
-				SET
-					allies_captain_id = $2,
-					allies_captain_name = $3,
-					axis_captain_id = $4,
-					axis_captain_name = $5,
-					first_pick_captain_id = $6,
-					pending_side_choice_captain_id = NULL,
-					next_turn = $7,
-					status = 'picking',
-					updated_at = NOW()
-				WHERE game_id = $1
-				""",
-				game_id,
-				allies_captain_id,
-				allies_captain_name,
-				axis_captain_id,
-				axis_captain_name,
-				first_pick_captain_id,
-				first_pick_side,
-			)
-
-
-async def set_captain_vote(game_id: int, voter_id: int, voter_name: str, candidate_user_id: int) -> bool:
-	"""Set one captain vote per voter. Returns False if candidate is not eligible."""
-	eligible = await fetchval(
-		"""
-		SELECT 1
-		FROM game_draft_players
-		WHERE game_id = $1 AND user_id = $2 AND up_for_captain = TRUE
-		""",
-		game_id,
-		candidate_user_id,
-	)
-	if not eligible:
-		return False
-
-	await execute(
-		"""
-		INSERT INTO game_draft_votes (game_id, voter_id, voter_name, candidate_user_id)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (game_id, voter_id)
-		DO UPDATE SET
-			candidate_user_id = EXCLUDED.candidate_user_id,
-			voter_name = EXCLUDED.voter_name,
-			updated_at = NOW()
-		""",
-		game_id,
-		voter_id,
-		voter_name,
-		candidate_user_id,
-	)
-	return True
-
-
-async def list_captain_candidates_with_votes(game_id: int) -> list[asyncpg.Record]:
+async def list_draft_reservations(game_id: int) -> list[asyncpg.Record]:
 	return await fetch(
 		"""
-		SELECT
-			p.user_id,
-			p.user_name,
-			p.role_preference,
-			p.up_for_captain,
-			p.side,
-			p.is_captain,
-			p.updated_at,
-			COUNT(v.id)::INT AS vote_count
-		FROM game_draft_players p
-		LEFT JOIN game_draft_votes v
-			ON v.game_id = p.game_id AND v.candidate_user_id = p.user_id
-		WHERE p.game_id = $1 AND p.up_for_captain = TRUE
-		GROUP BY p.user_id, p.user_name, p.role_preference, p.up_for_captain, p.side, p.is_captain, p.updated_at
-		ORDER BY vote_count DESC, p.updated_at ASC, p.user_id ASC
+		SELECT game_id, user_id, user_name, slot_type, captain_candidate, updated_at
+		FROM draft_reservations
+		WHERE game_id = $1
+		ORDER BY updated_at ASC
 		""",
 		game_id,
 	)
 
 
-async def get_top_captain_candidates(game_id: int, limit: int = 2) -> list[asyncpg.Record]:
-	rows = await list_captain_candidates_with_votes(game_id)
-	return rows[:limit]
+async def set_draft_reservation(
+	game_id: int,
+	user_id: int,
+	user_name: str,
+	slot_type: str,
+	captain_candidate: bool,
+) -> None:
+	normalized = normalize_draft_slot_type(slot_type)
+	if normalized is None:
+		raise ValueError("Invalid draft slot type")
 
-
-async def set_draft_board_message(game_id: int, message_id: int) -> None:
 	await execute(
 		"""
-		UPDATE game_draft_state
-		SET board_message_id = $2, updated_at = NOW()
-		WHERE game_id = $1
+		INSERT INTO draft_reservations (game_id, user_id, user_name, slot_type, captain_candidate)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (game_id, user_id)
+		DO UPDATE SET
+			user_name = EXCLUDED.user_name,
+			slot_type = EXCLUDED.slot_type,
+			captain_candidate = EXCLUDED.captain_candidate,
+			updated_at = NOW()
 		""",
 		game_id,
-		message_id,
+		user_id,
+		user_name,
+		normalized,
+		captain_candidate,
 	)
 
+	if not captain_candidate:
+		await execute(
+			"""
+			DELETE FROM draft_captain_votes
+			WHERE game_id = $1 AND candidate_user_id = $2
+			""",
+			game_id,
+			user_id,
+		)
 
-async def set_draft_status(game_id: int, status: str) -> None:
+
+async def clear_draft_reservation(game_id: int, user_id: int) -> bool:
+	result = await execute(
+		"""
+		DELETE FROM draft_reservations
+		WHERE game_id = $1 AND user_id = $2
+		""",
+		game_id,
+		user_id,
+	)
 	await execute(
 		"""
-		UPDATE game_draft_state
-		SET status = $2, updated_at = NOW()
-		WHERE game_id = $1
-		""",
-		game_id,
-		status,
-	)
-
-
-async def draft_pick_player(game_id: int, player_user_id: int, side: str) -> bool:
-	"""Move one unpicked player to a side."""
-	result = await execute(
-		"""
-		UPDATE game_draft_players
-		SET side = $3, picked_at = NOW(), updated_at = NOW()
-		WHERE game_id = $1 AND user_id = $2 AND side = 'unpicked' AND is_captain = FALSE
-		""",
-		game_id,
-		player_user_id,
-		side,
-	)
-	return _status_affected_rows(result) == 1
-
-
-async def admin_move_draft_player_to_unpicked(game_id: int, user_id: int) -> bool:
-	"""Admin helper to undo a draft pick for non-captain players."""
-	result = await execute(
-		"""
-		UPDATE game_draft_players
-		SET side = 'unpicked', picked_at = NULL, updated_at = NOW()
-		WHERE game_id = $1 AND user_id = $2 AND is_captain = FALSE AND side <> 'unpicked'
+		DELETE FROM draft_captain_votes
+		WHERE game_id = $1 AND (candidate_user_id = $2 OR voter_user_id = $2)
 		""",
 		game_id,
 		user_id,
@@ -1485,25 +1287,282 @@ async def admin_move_draft_player_to_unpicked(game_id: int, user_id: int) -> boo
 	return _status_affected_rows(result) == 1
 
 
-async def set_draft_next_turn(game_id: int, side: str) -> None:
+async def count_draft_captain_candidates(game_id: int) -> int:
+	count = await fetchval(
+		"""
+		SELECT COUNT(*)
+		FROM draft_reservations
+		WHERE game_id = $1 AND captain_candidate = TRUE
+		""",
+		game_id,
+	)
+	return int(count or 0)
+
+
+async def list_draft_captain_candidates(game_id: int) -> list[asyncpg.Record]:
+	return await fetch(
+		"""
+		SELECT game_id, user_id, user_name, slot_type, captain_candidate, updated_at
+		FROM draft_reservations
+		WHERE game_id = $1 AND captain_candidate = TRUE
+		ORDER BY updated_at ASC
+		""",
+		game_id,
+	)
+
+
+async def set_draft_captain_vote(game_id: int, voter_user_id: int, candidate_user_id: int) -> None:
 	await execute(
 		"""
-		UPDATE game_draft_state
-		SET next_turn = $2, updated_at = NOW()
+		INSERT INTO draft_captain_votes (game_id, voter_user_id, candidate_user_id)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (game_id, voter_user_id, candidate_user_id)
+		DO UPDATE SET updated_at = NOW()
+		""",
+		game_id,
+		voter_user_id,
+		candidate_user_id,
+	)
+
+
+async def list_draft_votes_by_voter(game_id: int, voter_user_id: int) -> list[asyncpg.Record]:
+	return await fetch(
+		"""
+		SELECT candidate_user_id, updated_at
+		FROM draft_captain_votes
+		WHERE game_id = $1 AND voter_user_id = $2
+		ORDER BY updated_at ASC, candidate_user_id ASC
+		""",
+		game_id,
+		voter_user_id,
+	)
+
+
+async def list_draft_captain_vote_totals(game_id: int) -> list[asyncpg.Record]:
+	return await fetch(
+		"""
+		SELECT candidate_user_id AS user_id, COUNT(*)::INT AS vote_count
+		FROM draft_captain_votes
+		WHERE game_id = $1
+		GROUP BY candidate_user_id
+		ORDER BY vote_count DESC, candidate_user_id ASC
+		""",
+		game_id,
+	)
+
+
+async def clear_draft_votes(game_id: int) -> None:
+	await execute("DELETE FROM draft_captain_votes WHERE game_id = $1", game_id)
+
+
+async def clear_draft_bans(game_id: int) -> None:
+	await execute("DELETE FROM draft_player_bans WHERE game_id = $1", game_id)
+
+
+async def add_draft_player_ban(
+	game_id: int,
+	captain_user_id: int,
+	target_user_id: int,
+	nation_tag: str,
+) -> bool:
+	result = await execute(
+		"""
+		INSERT INTO draft_player_bans (game_id, captain_user_id, target_user_id, nation_tag)
+		VALUES ($1, $2, $3, UPPER($4))
+		ON CONFLICT DO NOTHING
+		""",
+		game_id,
+		captain_user_id,
+		target_user_id,
+		nation_tag,
+	)
+	return _status_affected_rows(result) == 1
+
+
+async def list_draft_player_bans(game_id: int) -> list[asyncpg.Record]:
+	return await fetch(
+		"""
+		SELECT game_id, captain_user_id, target_user_id, nation_tag, created_at
+		FROM draft_player_bans
+		WHERE game_id = $1
+		ORDER BY created_at ASC
+		""",
+		game_id,
+	)
+
+
+async def get_draft_player_ban_by_captain(game_id: int, captain_user_id: int) -> asyncpg.Record | None:
+	return await fetchrow(
+		"""
+		SELECT game_id, captain_user_id, target_user_id, nation_tag, created_at
+		FROM draft_player_bans
+		WHERE game_id = $1 AND captain_user_id = $2
+		""",
+		game_id,
+		captain_user_id,
+	)
+
+
+async def get_draft_state(game_id: int) -> asyncpg.Record | None:
+	return await fetchrow(
+		"""
+		SELECT
+			game_id,
+			phase,
+			coin_winner_user_id,
+			allies_captain_user_id,
+			axis_captain_user_id,
+			starting_picker_user_id,
+			next_picker_user_id,
+			updated_at
+		FROM draft_states
 		WHERE game_id = $1
 		""",
 		game_id,
-		side,
 	)
 
 
-async def count_unpicked_draft_players(game_id: int) -> int:
-	value = await fetchval(
+async def create_draft_state_if_missing(game_id: int) -> None:
+	await execute(
 		"""
-		SELECT COUNT(*)
-		FROM game_draft_players
-		WHERE game_id = $1 AND side = 'unpicked' AND is_captain = FALSE
+		INSERT INTO draft_states (game_id)
+		VALUES ($1)
+		ON CONFLICT (game_id) DO NOTHING
 		""",
 		game_id,
 	)
-	return int(value or 0)
+
+
+async def update_draft_state(
+	game_id: int,
+	*,
+	phase: str | None = None,
+	coin_winner_user_id: int | None = None,
+	allies_captain_user_id: int | None = None,
+	axis_captain_user_id: int | None = None,
+	starting_picker_user_id: int | None = None,
+	next_picker_user_id: int | None = None,
+) -> None:
+	await create_draft_state_if_missing(game_id)
+
+	normalized_phase = phase if phase in DRAFT_PHASES else None
+	await execute(
+		"""
+		UPDATE draft_states
+		SET
+			phase = COALESCE($2, phase),
+			coin_winner_user_id = COALESCE($3, coin_winner_user_id),
+			allies_captain_user_id = COALESCE($4, allies_captain_user_id),
+			axis_captain_user_id = COALESCE($5, axis_captain_user_id),
+			starting_picker_user_id = COALESCE($6, starting_picker_user_id),
+			next_picker_user_id = COALESCE($7, next_picker_user_id),
+			updated_at = NOW()
+		WHERE game_id = $1
+		""",
+		game_id,
+		normalized_phase,
+		coin_winner_user_id,
+		allies_captain_user_id,
+		axis_captain_user_id,
+		starting_picker_user_id,
+		next_picker_user_id,
+	)
+
+
+async def reset_draft_state(game_id: int) -> None:
+	await execute("DELETE FROM draft_states WHERE game_id = $1", game_id)
+
+
+async def reset_draft_team_assignments(game_id: int) -> None:
+	await execute("DELETE FROM draft_team_assignments WHERE game_id = $1", game_id)
+
+
+async def add_draft_team_assignment(
+	game_id: int,
+	user_id: int,
+	user_name: str,
+	team_side: str,
+	picked_by_user_id: int,
+	pick_number: int,
+) -> bool:
+	if team_side not in {"allies", "axis"}:
+		raise ValueError("Invalid team side")
+	result = await execute(
+		"""
+		INSERT INTO draft_team_assignments (
+			game_id, user_id, user_name, team_side, picked_by_user_id, pick_number
+		)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (game_id, user_id) DO NOTHING
+		""",
+		game_id,
+		user_id,
+		user_name,
+		team_side,
+		picked_by_user_id,
+		pick_number,
+	)
+	return _status_affected_rows(result) == 1
+
+
+async def get_draft_team_assignment(game_id: int, user_id: int) -> asyncpg.Record | None:
+	return await fetchrow(
+		"""
+		SELECT game_id, user_id, user_name, team_side, picked_by_user_id, pick_number, created_at
+		FROM draft_team_assignments
+		WHERE game_id = $1 AND user_id = $2
+		""",
+		game_id,
+		user_id,
+	)
+
+
+async def list_draft_team_assignments(game_id: int) -> list[asyncpg.Record]:
+	return await fetch(
+		"""
+		SELECT game_id, user_id, user_name, team_side, picked_by_user_id, pick_number, created_at
+		FROM draft_team_assignments
+		WHERE game_id = $1
+		ORDER BY pick_number ASC, created_at ASC
+		""",
+		game_id,
+	)
+
+
+async def get_draft_pick_count(game_id: int) -> int:
+	count = await fetchval(
+		"""
+		SELECT COUNT(*)
+		FROM draft_team_assignments
+		WHERE game_id = $1 AND pick_number > 0
+		""",
+		game_id,
+	)
+	return int(count or 0)
+
+
+async def set_draft_team_side(game_id: int, user_id: int, team_side: str) -> bool:
+	if team_side not in {"allies", "axis"}:
+		raise ValueError("Invalid team side")
+	result = await execute(
+		"""
+		UPDATE draft_team_assignments
+		SET team_side = $3
+		WHERE game_id = $1 AND user_id = $2
+		""",
+		game_id,
+		user_id,
+		team_side,
+	)
+	return _status_affected_rows(result) == 1
+
+
+async def clear_all_sheet_reservations(game_id: int) -> None:
+	await execute(
+		"""
+		UPDATE game_nations
+		SET reserved_by = NULL, reserved_by_name = NULL, reserved_at = NULL
+		WHERE game_id = $1
+		""",
+		game_id,
+	)

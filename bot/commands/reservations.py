@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import random
 import re
+import random
 
 import discord
 from discord import app_commands
@@ -38,10 +38,13 @@ _NATION_FULL_NAMES = {
 	"JAPAN": "Japan",
 	"MAN": "Manchukuo",
 	"SIA": "Siam",
+	"FILL": "Fill",
 }
 
 
 class ReservationsCog(commands.Cog):
+	draft = app_commands.Group(name="draft", description="Draft reservations, captain voting, and team picks")
+
 	def __init__(self, bot: commands.Bot) -> None:
 		self.bot = bot
 
@@ -51,15 +54,160 @@ class ReservationsCog(commands.Cog):
 
 	def _is_public_slash_command(self, interaction: discord.Interaction) -> bool:
 		command_name = interaction.command.name if interaction.command else ""
-		return command_name in {
-			"reserve",
-			"unreserve",
-			"draft_join",
-			"draft_vote",
-			"draft_decide",
-			"draft_pick",
-			"draft_assign",
-		}
+		return command_name in {"reserve", "unreserve", "draft", "draft_preferences", "preferences"}
+
+	def _format_draft_slot(self, slot_type: str) -> str:
+		return db.draft_slot_label(slot_type)
+
+	def _is_late_allowed_preference(self, choice: str) -> bool:
+		normalized = choice.strip()
+		if not normalized:
+			return False
+		tag = normalized.split()[0].upper()
+		is_coop = bool(re.search(r"co\s*-?\s*op", normalized, flags=re.IGNORECASE))
+		return is_coop or tag == "VICHY"
+
+	def _nation_tag(self, nation_name: str) -> str:
+		base = nation_name.split(" (Co-op", 1)[0]
+		return base.split()[0].upper()
+
+	def _select_top_two_captains(
+		self,
+		candidates: list[object],
+		vote_totals: dict[int, int],
+	) -> list[int]:
+		sorted_ids = sorted(
+			[int(candidate["user_id"]) for candidate in candidates],
+			key=lambda user_id: (vote_totals.get(user_id, 0), random.random()),
+			reverse=True,
+		)
+		return sorted_ids[:2]
+
+	async def _build_draft_sheet_lines(self, game_id: int, title: str) -> list[str]:
+		reservations = await db.list_draft_reservations(game_id)
+		preferences = await db.list_game_preferences(game_id)
+		vote_rows = await db.list_draft_captain_vote_totals(game_id)
+		state = await db.get_draft_state(game_id)
+		assignments = await db.list_draft_team_assignments(game_id)
+		bans = await db.list_draft_player_bans(game_id)
+		sheet_rows = await db.list_sheet(game_id)
+
+		vote_totals = {int(row["user_id"]): int(row["vote_count"]) for row in vote_rows}
+		nation_by_user: dict[int, str] = {}
+		for row in sheet_rows:
+			if row["reserved_by"] is None:
+				continue
+			nation_by_user[int(row["reserved_by"])] = str(row["nation_name"])
+		total_slots = len(sheet_rows) if sheet_rows else len(db.build_nation_pool_for_preset("normal"))
+
+		preferences_by_user: dict[int, list[str]] = {}
+		for row in preferences:
+			preferences_by_user[int(row["user_id"])] = [str(choice) for choice in row["choices"]]
+
+		lines = [f"## Draft Lobby - {title}", ""]
+		lines.append(f"### Player Pool ({len(reservations)}/{total_slots}):")
+		if not reservations:
+			lines.append("No draft reservations yet. Use `/draft reserve`.")
+		else:
+			for index, row in enumerate(reservations, start=1):
+				user_id = int(row["user_id"])
+				badges: list[str] = []
+				if bool(row["captain_candidate"]):
+					badges.append("🎯")
+				if str(row["slot_type"]) == "late_hotjoin":
+					badges.append("⏰ Late")
+
+				line = f"{index}. <@{user_id}>"
+				if badges:
+					line += f" {' '.join(badges)}"
+
+				raw_choices = preferences_by_user.get(user_id, [])
+				if raw_choices:
+					formatted_choices = [self._format_preference_choice(choice) for choice in raw_choices]
+					line += f" — {', '.join(formatted_choices)}"
+				lines.append(line)
+
+		lines.extend(["", "### Captain Candidates"])
+		captain_rows = [row for row in reservations if bool(row["captain_candidate"])]
+		if not captain_rows:
+			lines.append("No captain candidates yet. Use `/draft reserve` with `captain:True`.")
+		else:
+			captain_rows.sort(
+				key=lambda row: (vote_totals.get(int(row["user_id"]), 0), -int(row["user_id"])),
+				reverse=True,
+			)
+			for row in captain_rows:
+				user_id = int(row["user_id"])
+				lines.append(f"- <@{user_id}>: {vote_totals.get(user_id, 0)} votes")
+
+		if state is not None:
+			lines.extend(["", "### Draft State"])
+			lines.append(f"- Phase: {str(state['phase']).replace('_', ' ').title()}")
+			phase = str(state["phase"])
+			if phase in {"choice_pending", "side_pending"}:
+				if state["allies_captain_user_id"]:
+					lines.append(f"- Captain A: <@{int(state['allies_captain_user_id'])}>")
+				if state["axis_captain_user_id"]:
+					lines.append(f"- Captain B: <@{int(state['axis_captain_user_id'])}>")
+			else:
+				if state["allies_captain_user_id"]:
+					lines.append(f"- Allies Captain: <@{int(state['allies_captain_user_id'])}>")
+				if state["axis_captain_user_id"]:
+					lines.append(f"- Axis Captain: <@{int(state['axis_captain_user_id'])}>")
+			if state["coin_winner_user_id"]:
+				lines.append(f"- Coin Winner: <@{int(state['coin_winner_user_id'])}>")
+			if state["next_picker_user_id"]:
+				lines.append(f"- Next Pick: <@{int(state['next_picker_user_id'])}>")
+
+		if assignments:
+			allies = [row for row in assignments if str(row["team_side"]) == "allies"]
+			axis = [row for row in assignments if str(row["team_side"]) == "axis"]
+
+			lines.extend(["", "### Teams"])
+			lines.append("Allies:")
+			for row in allies:
+				user_id = int(row["user_id"])
+				nation = nation_by_user.get(user_id, "No nation assigned")
+				pick_no = int(row["pick_number"])
+				prefix = "C" if pick_no == 0 else str(pick_no)
+				lines.append(f"- [{prefix}] <@{user_id}> - {nation}")
+			lines.append("Axis:")
+			for row in axis:
+				user_id = int(row["user_id"])
+				nation = nation_by_user.get(user_id, "No nation assigned")
+				pick_no = int(row["pick_number"])
+				prefix = "C" if pick_no == 0 else str(pick_no)
+				lines.append(f"- [{prefix}] <@{user_id}> - {nation}")
+
+		if bans:
+			lines.extend(["", "### Draft Bans"])
+			for row in bans:
+				captain_id = int(row["captain_user_id"])
+				target_id = int(row["target_user_id"])
+				nation_tag = str(row["nation_tag"]).upper()
+				lines.append(f"- <@{captain_id}> banned <@{target_id}> from **{nation_tag}** (incl. co-op slots)")
+
+		if sheet_rows:
+			lines.extend(["", "### Nation Sheet"])
+			nation_sheet_lines = db.build_sheet_display_lines(title, sheet_rows)
+			if nation_sheet_lines and nation_sheet_lines[0].startswith("## "):
+				nation_sheet_lines = nation_sheet_lines[2:] if len(nation_sheet_lines) > 1 and nation_sheet_lines[1] == "" else nation_sheet_lines[1:]
+			lines.extend(nation_sheet_lines)
+
+		lines.extend(
+			[
+				"",
+				"Reserve with `/draft reserve`.",
+				"Set preferences with `/draft_preferences` (up to 5 nations).",
+				"Captain signup: `/draft reserve` with `captain:True`.",
+				"Use `/draft reserve` with `late:True` if you cannot be there early.",
+				"Use `/draft vote` (up to 2 candidates, no self-vote), then host runs `/draft start`.",
+				"Player draft: captains use `/draft pick` to pull players to Allies/Axis.",
+				"Each captain can ban once with `/draft ban`, then run `/draft begin_assignments`.",
+				"Assignment phase: captains use `/draft assign` to place their side on nations.",
+			]
+		)
+		return lines
 
 	async def cog_check(self, ctx: commands.Context) -> bool:
 		if ctx.guild is None:
@@ -207,100 +355,7 @@ class ReservationsCog(commands.Cog):
 			return
 
 		if str(game["preset"]) == "no_sheet":
-			draft_state = await db.get_draft_state(game_id)
-			players = await db.list_draft_players(game_id)
-			candidate_rows = await db.list_captain_candidates_with_votes(game_id)
-			vote_map = {int(row["user_id"]): int(row["vote_count"]) for row in candidate_rows}
-			captain_pool = [row for row in players if str(row["side"]) == "captain"]
-			unpicked = [row for row in players if str(row["side"]) == "unpicked"]
-			allies = [row for row in players if str(row["side"]) == "allies"]
-			axis = [row for row in players if str(row["side"]) == "axis"]
-
-			captain_lines: list[str] = []
-			if draft_state is not None and draft_state["allies_captain_id"]:
-				captain_lines.append(f"- Allies: <@{int(draft_state['allies_captain_id'])}>")
-			if draft_state is not None and draft_state["axis_captain_id"]:
-				captain_lines.append(f"- Axis: <@{int(draft_state['axis_captain_id'])}>")
-			if not captain_lines and captain_pool:
-				for row in captain_pool:
-					role_text = str(row["role_preference"]).replace("_", " ").title()
-					votes = vote_map.get(int(row["user_id"]), 0)
-					captain_lines.append(f"- <@{int(row['user_id'])}> | Role: {role_text} | Captain votes: {votes}")
-			if not captain_lines:
-				captain_lines = ["- none"]
-
-			def _render_side_rows(rows: list, *, side_list_mode: bool = False) -> list[str]:
-				if not rows:
-					return ["- none"]
-				result: list[str] = []
-				for row in rows:
-					role_text = str(row["role_preference"]).replace("_", " ").title()
-					if side_list_mode:
-						result.append(f"- <@{int(row['user_id'])}> | Role: {role_text}")
-					else:
-						captain_opt_in = bool(row["up_for_captain"])
-						votes = vote_map.get(int(row["user_id"]), 0)
-						captain_vote_text = f" | Captain votes: {votes}" if captain_opt_in else ""
-						captain_opt_text = " | Captain candidate" if captain_opt_in else ""
-						captain_suffix = " (Captain)" if bool(row["is_captain"]) else ""
-						result.append(
-							f"- <@{int(row['user_id'])}>{captain_suffix} | Role: {role_text}{captain_opt_text}{captain_vote_text}"
-						)
-				return result
-
-			if draft_state is None:
-				status_line = "Draft status: setup"
-				turn_line = "Next pick: not started"
-			else:
-				status_text = str(draft_state["status"]).replace("_", " ").title()
-				status_line = f"Draft status: {status_text}"
-				state_status = str(draft_state["status"])
-				next_turn = str(draft_state["next_turn"])
-				if state_status == "captain_decision" and draft_state["team_decider_id"]:
-					turn_line = (
-						"Captain decision: "
-						f"<@{int(draft_state['team_decider_id'])}> chooses first pick or team side via `/draft_decide`."
-					)
-				elif state_status == "pending_side_choice" and draft_state["pending_side_choice_captain_id"]:
-					turn_line = (
-						"Captain decision: "
-						f"<@{int(draft_state['pending_side_choice_captain_id'])}> chooses team side via `/draft_decide`."
-					)
-				elif next_turn == "allies" and draft_state["allies_captain_id"]:
-					turn_line = f"Next pick: <@{int(draft_state['allies_captain_id'])}>"
-				elif next_turn == "axis" and draft_state["axis_captain_id"]:
-					turn_line = f"Next pick: <@{int(draft_state['axis_captain_id'])}>"
-				else:
-					turn_line = "Next pick: not set"
-
-			lines = [
-				f"## Draft Board — {game['title']}",
-				"",
-				status_line,
-				turn_line,
-				"",
-				"### Captains",
-				*captain_lines,
-				"",
-				"### Not Picked",
-				*_render_side_rows(unpicked),
-				"",
-				"### Allies",
-				*_render_side_rows(allies, side_list_mode=True),
-				"",
-				"### Axis",
-				*_render_side_rows(axis, side_list_mode=True),
-			]
-
-			sheet_rows = await db.list_sheet(game_id)
-			lines.extend(["", "---", ""])
-			lines.extend(db.build_sheet_display_lines(str(game["title"]), sheet_rows))
-			lines.extend(
-				[
-					"",
-					"Use `/draft_join` to enter pool with role/captain options, `/draft_vote` to vote captains, `/draft_start` to begin, `/draft_decide` for captain decision, `/draft_pick` for picks, and `/draft_assign` for nation assignment.",
-				]
-			)
+			lines = await self._build_draft_sheet_lines(game_id, str(game["title"]))
 		else:
 			rows = await db.list_sheet(game_id)
 			lines = db.build_sheet_display_lines(str(game["title"]), rows)
@@ -324,11 +379,8 @@ class ReservationsCog(commands.Cog):
 			await message.edit(content=content)
 
 		if str(game["preset"]) == "no_sheet":
-			await db.set_draft_board_message(game_id, message.id)
-
-		if str(game["preset"]) == "no_sheet":
 			try:
-				await message.pin(reason="Keep draft board visible")
+				await message.pin(reason="Keep draft lobby visible")
 			except (discord.Forbidden, discord.HTTPException):
 				pass
 
@@ -409,32 +461,17 @@ class ReservationsCog(commands.Cog):
 			await ctx.send(f"Game with ID {game_id} was not found.")
 			return
 
-		resolved_nation = await db.resolve_nation_name(game_id, nation_name)
-		if resolved_nation is None:
-			await ctx.send("Nation not found in sheet. Check spelling or create the sheet first.")
-			return
-
-		if bool(game["majors_locked"]) and db.is_major_non_coop_nation(resolved_nation):
-			role_id = await db.get_major_lock_role(int(game["guild_id"]))
-			if role_id and isinstance(ctx.author, discord.Member):
-				has_role = any(role.id == role_id for role in ctx.author.roles)
-				if not has_role:
-					role_obj = ctx.guild.get_role(role_id) if ctx.guild else None
-					role_label = role_obj.mention if role_obj else f"role ID {role_id}"
-					await ctx.send(f"You need {role_label} to reserve major main slots.")
-					return
-
 		success = await db.reserve_nation(
 			game_id=game_id,
-			nation_name=resolved_nation,
+			nation_name=nation_name,
 			user_id=ctx.author.id,
 			user_name=ctx.author.display_name,
 		)
 		if success:
-			await ctx.send(f"{ctx.author.mention} reserved **{resolved_nation}** for game **{game_id}**.")
+			await ctx.send(f"{ctx.author.mention} reserved **{nation_name}** for game **{game_id}**.")
 			return
 
-		reservation = await db.get_nation_reservation(game_id, resolved_nation)
+		reservation = await db.get_nation_reservation(game_id, nation_name)
 		if reservation is None:
 			await ctx.send("Nation not found in sheet. Check spelling or create the sheet first.")
 			return
@@ -475,7 +512,7 @@ class ReservationsCog(commands.Cog):
 		game_id = int(game["id"])
 		if str(game["preset"]) == "no_sheet":
 			await interaction.followup.send(
-				"This game uses captain draft mode. Use `/draft_join`, `/draft_vote`, `/draft_start`, `/draft_decide`, `/draft_pick`, and `/draft_assign`.",
+				"This game uses draft mode. Use `/draft reserve` instead.",
 				ephemeral=True,
 			)
 			return
@@ -605,22 +642,22 @@ class ReservationsCog(commands.Cog):
 
 		game_id = int(game["id"])
 		if str(game["preset"]) == "no_sheet":
-			removed = await db.draft_leave_player(game_id, interaction.user.id)
+			removed = await db.clear_draft_reservation(game_id, interaction.user.id)
 			if removed:
 				await self._refresh_sheet_message(game_id)
 				await self._notify_admin_unreserve(
 					interaction.guild,
 					interaction.user.display_name,
-					"draft pool",
+					"draft reservation",
 					str(game["title"]),
 				)
 				await interaction.followup.send(
-					"You were removed from the unpicked draft pool.",
+					"Your draft reservation was removed.",
 					ephemeral=True,
 				)
 			else:
 				await interaction.followup.send(
-					"You can only leave while unpicked and not a captain.",
+					"You do not currently have a draft reservation in this game.",
 					ephemeral=True,
 				)
 			return
@@ -670,372 +707,533 @@ class ReservationsCog(commands.Cog):
 	) -> list[app_commands.Choice[str]]:
 		return await self._available_nation_autocomplete(interaction, current)
 
-	@app_commands.command(name="draft_join", description="Join no-sheet draft with role preference and captain opt-in")
+	async def _get_draft_game_in_thread(
+		self,
+		interaction: discord.Interaction,
+	) -> tuple[discord.Thread | None, int | None, object | None]:
+		if not isinstance(interaction.channel, discord.Thread):
+			await interaction.followup.send("Use this command inside a game thread.", ephemeral=True)
+			return None, None, None
+
+		game = await db.get_game_by_thread_id(interaction.channel.id)
+		if game is None:
+			await interaction.followup.send("This thread is not linked to an active game.", ephemeral=True)
+			return None, None, None
+
+		if str(game["preset"]) != "no_sheet":
+			await interaction.followup.send("This game is not a draft preset game.", ephemeral=True)
+			return None, None, None
+
+		if interaction.guild and int(game["guild_id"]) != int(interaction.guild.id):
+			await interaction.followup.send("Game/server mismatch.", ephemeral=True)
+			return None, None, None
+
+		return interaction.channel, int(game["id"]), game
+
+	@draft.command(name="reserve", description="Join the draft pool and optionally mark yourself captain/late")
 	@app_commands.describe(
-		role="Your preferred role",
-		up_for_captain="Set true if you want to be captain candidate",
+		captain="Also join captain candidates",
+		late="Mark yourself as late (cannot be captain)",
 	)
-	@app_commands.choices(
-		role=[
-			app_commands.Choice(name="Major", value="major"),
-			app_commands.Choice(name="Minor", value="minor"),
-			app_commands.Choice(name="Fill", value="fill"),
-			app_commands.Choice(name="Late hotjoin", value="late_hotjoin"),
-		]
-	)
-	async def draft_join_slash(
+	async def draft_reserve_slash(
 		self,
 		interaction: discord.Interaction,
-		role: app_commands.Choice[str],
-		up_for_captain: bool = False,
+		captain: bool = False,
+		late: bool = False,
 	) -> None:
 		if not await self._safe_defer(interaction):
 			return
 
-		if not isinstance(interaction.channel, discord.Thread):
-			await interaction.followup.send("Use `/draft_join` in the game thread.", ephemeral=True)
+		_, game_id, game = await self._get_draft_game_in_thread(interaction)
+		if game_id is None or game is None:
 			return
 
-		game = await db.get_game_by_thread_id(interaction.channel.id)
-		if game is None:
-			await interaction.followup.send("This thread is not linked to an active game.", ephemeral=True)
-			return
-
-		if str(game["preset"]) != "no_sheet":
-			await interaction.followup.send("This game does not use captain draft mode.", ephemeral=True)
-			return
-
-		state = await db.get_draft_state(int(game["id"]))
-		if state is not None and str(state["status"]) != "setup":
-			await interaction.followup.send("Draft has already started. Joining is locked.", ephemeral=True)
-			return
-
-		await db.draft_join_player(
-			int(game["id"]),
-			interaction.user.id,
-			interaction.user.display_name,
-			role_preference=role.value,
-			up_for_captain=up_for_captain,
-		)
-		await self._refresh_sheet_message(int(game["id"]))
-		await interaction.followup.send(
-			f"You are in the draft pool. Role: **{role.name}**. Captain candidate: **{'Yes' if up_for_captain else 'No'}**.",
-			ephemeral=True,
-		)
-
-	@app_commands.command(name="draft_vote", description="Vote for a captain candidate")
-	@app_commands.describe(candidate="Player to vote for as captain")
-	async def draft_vote_slash(self, interaction: discord.Interaction, candidate: discord.Member) -> None:
-		if not await self._safe_defer(interaction):
-			return
-
-		if not isinstance(interaction.channel, discord.Thread):
-			await interaction.followup.send("Use `/draft_vote` in the game thread.", ephemeral=True)
-			return
-
-		game = await db.get_game_by_thread_id(interaction.channel.id)
-		if game is None:
-			await interaction.followup.send("This thread is not linked to an active game.", ephemeral=True)
-			return
-
-		if str(game["preset"]) != "no_sheet":
-			await interaction.followup.send("This game does not use captain draft mode.", ephemeral=True)
-			return
-
-		game_id = int(game["id"])
-		state = await db.get_draft_state(game_id)
-		if state is not None and str(state["status"]) != "setup":
-			await interaction.followup.send("Captain voting is closed after `/draft_start`.", ephemeral=True)
-			return
-
-		voter = await db.get_draft_player(game_id, interaction.user.id)
-		if voter is None:
-			await interaction.followup.send("Join first with `/draft_join` before voting.", ephemeral=True)
-			return
-
-		if int(candidate.id) == int(interaction.user.id):
-			await interaction.followup.send("You cannot vote for yourself.", ephemeral=True)
-			return
-
-		target = await db.get_draft_player(game_id, candidate.id)
-		if target is None:
-			await interaction.followup.send("That user is not in the draft pool.", ephemeral=True)
-			return
-
-		if not bool(target["up_for_captain"]):
-			await interaction.followup.send("That player is not up for captain.", ephemeral=True)
-			return
-
-		ok = await db.set_captain_vote(game_id, interaction.user.id, interaction.user.display_name, candidate.id)
-		if not ok:
-			await interaction.followup.send("Could not save vote. Candidate may no longer be eligible.", ephemeral=True)
-			return
-
-		await self._refresh_sheet_message(game_id)
-		await interaction.followup.send(f"Your vote was saved for {candidate.mention}.", ephemeral=True)
-
-	@app_commands.command(name="draft_start", description="Start captain draft using top 2 voted candidates")
-	async def draft_start_slash(
-		self,
-		interaction: discord.Interaction,
-	) -> None:
-		if not await self._safe_defer(interaction, ephemeral=False):
-			return
-
-		if not isinstance(interaction.channel, discord.Thread):
-			await interaction.followup.send("Use `/draft_start` in the game thread.", ephemeral=True)
-			return
-
-		game = await db.get_game_by_thread_id(interaction.channel.id)
-		if game is None:
-			await interaction.followup.send("This thread is not linked to an active game.", ephemeral=True)
-			return
-
-		if str(game["preset"]) != "no_sheet":
-			await interaction.followup.send("This game does not use captain draft mode.", ephemeral=True)
-			return
-
-		game_id = int(game["id"])
-		top_candidates = await db.get_top_captain_candidates(game_id, limit=2)
-		if len(top_candidates) < 2:
+		if captain and late:
 			await interaction.followup.send(
-				"Need at least 2 captain candidates with votes. Ask players to `/draft_join` with captain opt-in and use `/draft_vote`.",
+				"Late players cannot be captain candidates.",
 				ephemeral=True,
 			)
 			return
 
-		captain_a = top_candidates[0]
-		captain_b = top_candidates[1]
-		decider = random.choice([captain_a, captain_b])
-		other = captain_b if int(decider["user_id"]) == int(captain_a["user_id"]) else captain_a
+		if late:
+			saved_preferences = await db.get_game_preferences_for_user(game_id, interaction.user.id)
+			if saved_preferences is not None:
+				choices = [str(choice) for choice in saved_preferences["choices"]]
+				invalid = [choice for choice in choices if not self._is_late_allowed_preference(choice)]
+				if invalid:
+					await interaction.followup.send(
+						"Your current preferences include major/minor picks. "
+						"Late players can only keep co-op slots and VICHY. "
+						"Update them first with `/draft_preferences`.",
+						ephemeral=True,
+					)
+					return
 
-		await db.initialize_draft_captain_decision(
+		slot_value = "late_hotjoin" if late else "player"
+
+		existing = await db.get_draft_reservation(game_id, interaction.user.id)
+		if existing is not None and bool(existing["captain_candidate"]) and captain:
+			# No-op path kept explicit so users can re-run with same captain preference.
+			pass
+
+		await db.set_draft_reservation(
 			game_id=game_id,
-			captain_a_id=int(captain_a["user_id"]),
-			captain_a_name=str(captain_a["user_name"]),
-			captain_b_id=int(captain_b["user_id"]),
-			captain_b_name=str(captain_b["user_name"]),
-			team_decider_id=int(decider["user_id"]),
-			team_decider_name=str(decider["user_name"]),
+			user_id=interaction.user.id,
+			user_name=interaction.user.display_name,
+			slot_type=slot_value,
+			captain_candidate=captain,
 		)
+		await self._refresh_sheet_message(game_id)
+
+		status_parts: list[str] = []
+		if captain:
+			status_parts.append("captain candidate")
+		if late:
+			status_parts.append("late")
+		status = f" ({', '.join(status_parts)})" if status_parts else ""
+		await interaction.followup.send(
+			f"Saved draft reservation{status}.",
+			ephemeral=True,
+		)
+
+	@draft.command(name="unreserve", description="Remove your draft reservation")
+	async def draft_unreserve_slash(self, interaction: discord.Interaction) -> None:
+		if not await self._safe_defer(interaction):
+			return
+
+		_, game_id, _ = await self._get_draft_game_in_thread(interaction)
+		if game_id is None:
+			return
+
+		removed = await db.clear_draft_reservation(game_id, interaction.user.id)
+		if not removed:
+			await interaction.followup.send("You do not have a draft reservation in this game.", ephemeral=True)
+			return
 
 		await self._refresh_sheet_message(game_id)
+		await interaction.followup.send("Removed your draft reservation.", ephemeral=True)
+
+	@draft.command(name="vote", description="Vote for captain candidates (up to two total)")
+	@app_commands.describe(candidate="Captain candidate to vote for")
+	async def draft_vote_slash(self, interaction: discord.Interaction, candidate: discord.Member) -> None:
+		if not await self._safe_defer(interaction):
+			return
+
+		_, game_id, _ = await self._get_draft_game_in_thread(interaction)
+		if game_id is None:
+			return
+
+		voter_row = await db.get_draft_reservation(game_id, interaction.user.id)
+		if voter_row is None:
+			await interaction.followup.send("Reserve a draft slot first using `/draft reserve`.", ephemeral=True)
+			return
+
+		if candidate.id == interaction.user.id:
+			await interaction.followup.send("Captain candidates cannot vote for themselves.", ephemeral=True)
+			return
+
+		candidate_row = await db.get_draft_reservation(game_id, candidate.id)
+		if candidate_row is None or not bool(candidate_row["captain_candidate"]):
+			await interaction.followup.send("That user is not a captain candidate in this draft.", ephemeral=True)
+			return
+
+		existing_votes = await db.list_draft_votes_by_voter(game_id, interaction.user.id)
+		existing_candidate_ids = {int(row["candidate_user_id"]) for row in existing_votes}
+		if int(candidate.id) in existing_candidate_ids:
+			await interaction.followup.send(f"You already voted for {candidate.mention}.", ephemeral=True)
+			return
+		if len(existing_candidate_ids) >= 2:
+			await interaction.followup.send("You already used both captain votes (max 2).", ephemeral=True)
+			return
+
+		await db.set_draft_captain_vote(game_id, interaction.user.id, candidate.id)
+		await self._refresh_sheet_message(game_id)
 		await interaction.followup.send(
-			(
-				"Captains selected by votes:\n"
-				f"- <@{int(captain_a['user_id'])}> ({int(captain_a['vote_count'])} votes)\n"
-				f"- <@{int(captain_b['user_id'])}> ({int(captain_b['vote_count'])} votes)\n\n"
-				f"Random decision captain: <@{int(decider['user_id'])}>.\n"
-				"Use `/draft_decide` to choose either first pick or team side."
-			)
+			f"Vote saved for {candidate.mention}. You have used {len(existing_candidate_ids) + 1}/2 votes.",
+			ephemeral=True,
 		)
 
-	@app_commands.command(name="draft_decide", description="Captain decision: first pick or team side")
-	@app_commands.describe(
-		decision="Pick first pick or team side",
-		side="Side to lead when choosing team side",
-	)
+	@draft.command(name="start", description="Start draft using top-2 voted captain candidates")
+	async def draft_start_slash(self, interaction: discord.Interaction) -> None:
+		if not await self._safe_defer(interaction, ephemeral=False):
+			return
+
+		_, game_id, game = await self._get_draft_game_in_thread(interaction)
+		if game_id is None or game is None:
+			return
+
+		is_host = int(game["host_discord_id"]) == int(interaction.user.id)
+		has_access = await interaction_user_has_bot_access(interaction)
+		if not is_host and not has_access:
+			await interaction.followup.send("Only the host or bot staff can start the draft.", ephemeral=True)
+			return
+
+		candidates = await db.list_draft_captain_candidates(game_id)
+		if len(candidates) < 2:
+			await interaction.followup.send("Need exactly two captain candidates before starting.", ephemeral=True)
+			return
+
+		vote_rows = await db.list_draft_captain_vote_totals(game_id)
+		vote_totals = {int(row["user_id"]): int(row["vote_count"]) for row in vote_rows}
+		top_two = self._select_top_two_captains(candidates, vote_totals)
+		if len(top_two) < 2:
+			await interaction.followup.send("Could not determine the top two captains.", ephemeral=True)
+			return
+
+		captain_a, captain_b = top_two[0], top_two[1]
+		coin_winner = random.choice([captain_a, captain_b])
+
+		await db.create_reservation_sheet_for_preset(game_id, "normal")
+		await db.clear_all_sheet_reservations(game_id)
+		await db.reset_draft_team_assignments(game_id)
+		await db.reset_draft_state(game_id)
+		await db.clear_draft_bans(game_id)
+
+		captain_a_name = interaction.guild.get_member(captain_a).display_name if interaction.guild and interaction.guild.get_member(captain_a) else f"user-{captain_a}"
+		captain_b_name = interaction.guild.get_member(captain_b).display_name if interaction.guild and interaction.guild.get_member(captain_b) else f"user-{captain_b}"
+		# Temporary sides until `/draft side` finalizes them.
+		await db.add_draft_team_assignment(game_id, captain_a, captain_a_name, "allies", captain_a, 0)
+		await db.add_draft_team_assignment(game_id, captain_b, captain_b_name, "axis", captain_b, 0)
+
+		await db.update_draft_state(
+			game_id,
+			phase="choice_pending",
+			coin_winner_user_id=coin_winner,
+			allies_captain_user_id=captain_a,
+			axis_captain_user_id=captain_b,
+		)
+		await db.clear_draft_votes(game_id)
+		await self._refresh_sheet_message(game_id)
+
+		await interaction.followup.send(
+			"Draft started. Captains selected:\n"
+			f"- Captain A: <@{captain_a}>\n"
+			f"- Captain B: <@{captain_b}>\n"
+			f"Coin winner: <@{coin_winner}>\n"
+			"Coin winner must now choose with `/draft choose`.",
+		)
+
+	@draft.command(name="choose", description="Coin winner chooses first pick or side choice")
+	@app_commands.describe(option="Choose first pick or choose side")
 	@app_commands.choices(
-		decision=[
-			app_commands.Choice(name="First pick", value="first_pick"),
-			app_commands.Choice(name="Choose team side", value="team_side"),
-		],
-		side=[
-			app_commands.Choice(name="Allies", value="allies"),
-			app_commands.Choice(name="Axis", value="axis"),
-		],
+		option=[
+			app_commands.Choice(name="Take first pick", value="first_pick"),
+			app_commands.Choice(name="Choose side (Axis/Allies)", value="choose_side"),
+		]
 	)
-	async def draft_decide_slash(
+	async def draft_choose_slash(
 		self,
 		interaction: discord.Interaction,
-		decision: app_commands.Choice[str],
-		side: app_commands.Choice[str] | None = None,
+		option: app_commands.Choice[str],
 	) -> None:
 		if not await self._safe_defer(interaction, ephemeral=False):
 			return
 
-		if not isinstance(interaction.channel, discord.Thread):
-			await interaction.followup.send("Use `/draft_decide` in the game thread.", ephemeral=True)
+		_, game_id, _ = await self._get_draft_game_in_thread(interaction)
+		if game_id is None:
 			return
 
-		game = await db.get_game_by_thread_id(interaction.channel.id)
-		if game is None:
-			await interaction.followup.send("This thread is not linked to an active game.", ephemeral=True)
-			return
-
-		if str(game["preset"]) != "no_sheet":
-			await interaction.followup.send("This game does not use captain draft mode.", ephemeral=True)
-			return
-
-		game_id = int(game["id"])
 		state = await db.get_draft_state(game_id)
-		if state is None:
-			await interaction.followup.send("Draft has not started yet. Use `/draft_start`.", ephemeral=True)
+		if state is None or str(state["phase"]) != "choice_pending":
+			await interaction.followup.send("Draft is not waiting for the coin winner choice.", ephemeral=True)
 			return
 
-		status = str(state["status"])
-		if status == "captain_decision":
-			if not state["team_decider_id"] or int(interaction.user.id) != int(state["team_decider_id"]):
-				await interaction.followup.send("Only the random decision captain can do this step.", ephemeral=True)
-				return
+		coin_winner = int(state["coin_winner_user_id"]) if state["coin_winner_user_id"] else None
+		if coin_winner is None or int(interaction.user.id) != coin_winner:
+			await interaction.followup.send("Only the coin winner can use this command now.", ephemeral=True)
+			return
 
-			captains = [row for row in await db.list_draft_players_by_side(game_id, "captain") if bool(row["is_captain"])]
-			if len(captains) != 2:
-				await interaction.followup.send("Expected exactly 2 captains in captain pool.", ephemeral=True)
-				return
-
-			other_captain = captains[0] if int(captains[1]["user_id"]) == int(interaction.user.id) else captains[1]
-
-			if decision.value == "first_pick":
-				await db.set_draft_first_pick_choice(
-					game_id,
-					first_pick_captain_id=interaction.user.id,
-					pending_side_choice_captain_id=int(other_captain["user_id"]),
-				)
-				await self._refresh_sheet_message(game_id)
-				await interaction.followup.send(
-					f"You chose **First Pick**. <@{int(other_captain['user_id'])}> now chooses team side with `/draft_decide decision:Choose team side side:<Allies/Axis>`.",
-				)
-				return
-
-			if side is None:
-				await interaction.followup.send("When choosing team side, include `side` (Allies or Axis).", ephemeral=True)
-				return
-
-			chosen_side = side.value
-			first_pick_captain_id = int(other_captain["user_id"])
-			if chosen_side == "allies":
-				allies_id, allies_name = interaction.user.id, interaction.user.display_name
-				axis_id, axis_name = int(other_captain["user_id"]), str(other_captain["user_name"])
-			else:
-				axis_id, axis_name = interaction.user.id, interaction.user.display_name
-				allies_id, allies_name = int(other_captain["user_id"]), str(other_captain["user_name"])
-
-			await db.finalize_draft_sides(
-				game_id=game_id,
-				allies_captain_id=allies_id,
-				allies_captain_name=allies_name,
-				axis_captain_id=axis_id,
-				axis_captain_name=axis_name,
-				first_pick_captain_id=first_pick_captain_id,
+		if option.value == "first_pick":
+			await db.update_draft_state(
+				game_id,
+				phase="side_pending",
+				starting_picker_user_id=coin_winner,
 			)
 			await self._refresh_sheet_message(game_id)
+			allies_captain = int(state["allies_captain_user_id"]) if state["allies_captain_user_id"] else None
+			axis_captain = int(state["axis_captain_user_id"]) if state["axis_captain_user_id"] else None
+			if allies_captain is None or axis_captain is None:
+				await interaction.followup.send("Draft state is incomplete. Restart with `/draft start`.", ephemeral=True)
+				return
+			other_captain = axis_captain if coin_winner == allies_captain else allies_captain
 			await interaction.followup.send(
-				f"Sides set. Draft picks start now. First pick: <@{first_pick_captain_id}>.",
+				"Choice locked: coin winner takes first pick. "
+				f"Now <@{other_captain}> must choose side with `/draft side`.",
 			)
 			return
 
-		if status == "pending_side_choice":
-			if not state["pending_side_choice_captain_id"] or int(interaction.user.id) != int(state["pending_side_choice_captain_id"]):
-				await interaction.followup.send("Only the pending captain can choose team side now.", ephemeral=True)
-				return
+		await db.update_draft_state(game_id, phase="side_pending")
+		await self._refresh_sheet_message(game_id)
+		await interaction.followup.send(
+			"Choice locked: pick a side now with `/draft side`.",
+		)
 
-			if decision.value != "team_side" or side is None:
-				await interaction.followup.send("You must choose team side now with `decision:Choose team side` and a side.", ephemeral=True)
-				return
-
-			captains = [row for row in await db.list_draft_players_by_side(game_id, "captain") if bool(row["is_captain"])]
-			if len(captains) != 2 or not state["first_pick_captain_id"]:
-				await interaction.followup.send("Draft state is invalid. Restart with `/draft_start`.", ephemeral=True)
-				return
-
-			first_pick_captain_id = int(state["first_pick_captain_id"])
-			first_pick_row = captains[0] if int(captains[0]["user_id"]) == first_pick_captain_id else captains[1]
-
-			chosen_side = side.value
-			if chosen_side == "allies":
-				allies_id, allies_name = interaction.user.id, interaction.user.display_name
-				axis_id, axis_name = int(first_pick_row["user_id"]), str(first_pick_row["user_name"])
-			else:
-				axis_id, axis_name = interaction.user.id, interaction.user.display_name
-				allies_id, allies_name = int(first_pick_row["user_id"]), str(first_pick_row["user_name"])
-
-			await db.finalize_draft_sides(
-				game_id=game_id,
-				allies_captain_id=allies_id,
-				allies_captain_name=allies_name,
-				axis_captain_id=axis_id,
-				axis_captain_name=axis_name,
-				first_pick_captain_id=first_pick_captain_id,
-			)
-			await self._refresh_sheet_message(game_id)
-			await interaction.followup.send(
-				f"Sides set. Draft picks start now. First pick: <@{first_pick_captain_id}>.",
-			)
+	@draft.command(name="side", description="Choose Allies or Axis when side choice is pending")
+	@app_commands.describe(team="Team side for the captain currently choosing side")
+	@app_commands.choices(
+		team=[
+			app_commands.Choice(name="Allies", value="allies"),
+			app_commands.Choice(name="Axis", value="axis"),
+		]
+	)
+	async def draft_side_slash(
+		self,
+		interaction: discord.Interaction,
+		team: app_commands.Choice[str],
+	) -> None:
+		if not await self._safe_defer(interaction):
 			return
 
-		await interaction.followup.send("Draft is not in captain decision stage.", ephemeral=True)
-
-	@app_commands.command(name="draft_pick", description="Captain picks one player")
-	@app_commands.describe(player="Player to pick")
-	async def draft_pick_slash(self, interaction: discord.Interaction, player: discord.Member) -> None:
-		if not await self._safe_defer(interaction, ephemeral=False):
+		_, game_id, _ = await self._get_draft_game_in_thread(interaction)
+		if game_id is None:
 			return
 
-		if not isinstance(interaction.channel, discord.Thread):
-			await interaction.followup.send("Use `/draft_pick` in the game thread.", ephemeral=True)
-			return
-
-		game = await db.get_game_by_thread_id(interaction.channel.id)
-		if game is None:
-			await interaction.followup.send("This thread is not linked to an active game.", ephemeral=True)
-			return
-
-		if str(game["preset"]) != "no_sheet":
-			await interaction.followup.send("This game does not use captain draft mode.", ephemeral=True)
-			return
-
-		game_id = int(game["id"])
 		state = await db.get_draft_state(game_id)
-		if state is None or str(state["status"]) != "picking":
-			await interaction.followup.send("Draft is not currently in picking stage.", ephemeral=True)
+		if state is None or str(state["phase"]) != "side_pending":
+			await interaction.followup.send("Draft is not waiting for side selection.", ephemeral=True)
 			return
 
-		acting_side: str | None = None
-		if int(interaction.user.id) == int(state["allies_captain_id"]):
-			acting_side = "allies"
-		elif int(interaction.user.id) == int(state["axis_captain_id"]):
-			acting_side = "axis"
-
-		if acting_side is None:
-			await interaction.followup.send("Only captains can pick players.", ephemeral=True)
+		coin_winner = int(state["coin_winner_user_id"]) if state["coin_winner_user_id"] else None
+		allies_captain = int(state["allies_captain_user_id"]) if state["allies_captain_user_id"] else None
+		axis_captain = int(state["axis_captain_user_id"]) if state["axis_captain_user_id"] else None
+		starting_picker = int(state["starting_picker_user_id"]) if state["starting_picker_user_id"] else None
+		if coin_winner is None or allies_captain is None or axis_captain is None:
+			await interaction.followup.send("Draft state is incomplete. Restart with `/draft start`.", ephemeral=True)
 			return
 
-		next_turn = str(state["next_turn"])
-		if next_turn != acting_side:
-			await interaction.followup.send("It is not your turn to pick.", ephemeral=True)
+		first_pick_locked = starting_picker is not None and starting_picker == coin_winner
+		side_chooser = coin_winner
+		if first_pick_locked:
+			side_chooser = axis_captain if coin_winner == allies_captain else allies_captain
+
+		if int(interaction.user.id) != side_chooser:
+			await interaction.followup.send(f"Only <@{side_chooser}> can pick side right now.", ephemeral=True)
 			return
 
-		target = await db.get_draft_player(game_id, player.id)
-		if target is None:
-			await interaction.followup.send("That user is not in the draft pool. Ask them to use `/draft_join`.", ephemeral=True)
-			return
+		if team.value == "allies" and side_chooser == axis_captain:
+			allies_captain, axis_captain = axis_captain, allies_captain
+		if team.value == "axis" and side_chooser == allies_captain:
+			allies_captain, axis_captain = axis_captain, allies_captain
 
-		if bool(target["is_captain"]):
-			await interaction.followup.send("Captains cannot be picked.", ephemeral=True)
-			return
+		await db.set_draft_team_side(game_id, allies_captain, "allies")
+		await db.set_draft_team_side(game_id, axis_captain, "axis")
 
-		if str(target["side"]) != "unpicked":
-			await interaction.followup.send("That player has already been picked.", ephemeral=True)
-			return
-
-		moved = await db.draft_pick_player(game_id, player.id, acting_side)
-		if not moved:
-			await interaction.followup.send("Could not apply pick. Try again.", ephemeral=True)
-			return
-
-		remaining = await db.count_unpicked_draft_players(game_id)
-		if remaining == 0:
-			await db.set_draft_status(game_id, "assigning")
+		if first_pick_locked:
+			first_picker = coin_winner
 		else:
-			await db.set_draft_next_turn(game_id, "axis" if acting_side == "allies" else "allies")
+			first_picker = axis_captain if side_chooser == allies_captain else allies_captain
+		await db.update_draft_state(
+			game_id,
+			phase="drafting",
+			allies_captain_user_id=allies_captain,
+			axis_captain_user_id=axis_captain,
+			starting_picker_user_id=first_picker,
+			next_picker_user_id=first_picker,
+		)
+		await self._refresh_sheet_message(game_id)
+		await interaction.followup.send(
+			f"Sides locked. First pick goes to <@{first_picker}>. Use `/draft pick`.",
+		)
+
+	@draft.command(name="pick", description="Captain picks one player to their side")
+	@app_commands.describe(player="Player to draft")
+	async def draft_pick_slash(
+		self,
+		interaction: discord.Interaction,
+		player: discord.Member,
+	) -> None:
+		if not await self._safe_defer(interaction):
+			return
+
+		_, game_id, _ = await self._get_draft_game_in_thread(interaction)
+		if game_id is None:
+			return
+
+		state = await db.get_draft_state(game_id)
+		if state is None or str(state["phase"]) != "drafting":
+			await interaction.followup.send("Draft is not currently in picking phase.", ephemeral=True)
+			return
+
+		next_picker = int(state["next_picker_user_id"]) if state["next_picker_user_id"] else None
+		allies_captain = int(state["allies_captain_user_id"]) if state["allies_captain_user_id"] else None
+		axis_captain = int(state["axis_captain_user_id"]) if state["axis_captain_user_id"] else None
+		if next_picker is None or allies_captain is None or axis_captain is None:
+			await interaction.followup.send("Draft state is incomplete. Restart with `/draft start`.", ephemeral=True)
+			return
+
+		if int(interaction.user.id) != next_picker:
+			await interaction.followup.send(f"It is not your turn. Next picker is <@{next_picker}>.", ephemeral=True)
+			return
+
+		picked_reservation = await db.get_draft_reservation(game_id, player.id)
+		if picked_reservation is None:
+			await interaction.followup.send("That player is not in the draft reservation pool.", ephemeral=True)
+			return
+
+		if str(picked_reservation["slot_type"]) == "late_hotjoin":
+			await interaction.followup.send("Late Hotjoin players cannot be drafted now.", ephemeral=True)
+			return
+
+		if player.id in {allies_captain, axis_captain}:
+			await interaction.followup.send("Captains are already assigned; pick another player.", ephemeral=True)
+			return
+
+		existing_pick = await db.get_draft_team_assignment(game_id, player.id)
+		if existing_pick is not None:
+			await interaction.followup.send("That player has already been drafted.", ephemeral=True)
+			return
+
+		team_side = "allies" if int(interaction.user.id) == allies_captain else "axis"
+		pick_no = (await db.get_draft_pick_count(game_id)) + 1
+		await db.add_draft_team_assignment(
+			game_id=game_id,
+			user_id=player.id,
+			user_name=player.display_name,
+			team_side=team_side,
+			picked_by_user_id=interaction.user.id,
+			pick_number=pick_no,
+		)
+
+		reservations = await db.list_draft_reservations(game_id)
+		eligible_player_ids = {
+			int(row["user_id"])
+			for row in reservations
+			if str(row["slot_type"]) != "late_hotjoin" and int(row["user_id"]) not in {allies_captain, axis_captain}
+		}
+		assigned_rows = await db.list_draft_team_assignments(game_id)
+		assigned_ids = {int(row["user_id"]) for row in assigned_rows}
+		remaining_ids = eligible_player_ids - assigned_ids
+
+		if not remaining_ids:
+			await db.update_draft_state(game_id, phase="ban_pending", next_picker_user_id=0)
+			await self._refresh_sheet_message(game_id)
+			await interaction.followup.send(
+				f"Player draft complete. {player.mention} joined **{team_side.title()}**. "
+				"Captains: use `/draft ban` once each, then `/draft begin_assignments`.",
+			)
+			return
+
+		next_turn = axis_captain if int(interaction.user.id) == allies_captain else allies_captain
+		await db.update_draft_state(game_id, next_picker_user_id=next_turn)
+		await self._refresh_sheet_message(game_id)
+		await interaction.followup.send(
+			f"Pick locked: {player.mention} joined **{team_side.title()}**. Next picker: <@{next_turn}>.",
+		)
+
+	@draft.command(name="ban", description="Captain bans one opposing player from one nation tag")
+	@app_commands.describe(player="Opposing drafted player to ban", nation="Nation tag/name to ban (major ban includes co-ops)")
+	async def draft_ban_slash(
+		self,
+		interaction: discord.Interaction,
+		player: discord.Member,
+		nation: str,
+	) -> None:
+		if not await self._safe_defer(interaction):
+			return
+
+		_, game_id, _ = await self._get_draft_game_in_thread(interaction)
+		if game_id is None:
+			return
+
+		state = await db.get_draft_state(game_id)
+		if state is None or str(state["phase"]) != "ban_pending":
+			await interaction.followup.send("Draft is not in ban phase.", ephemeral=True)
+			return
+
+		allies_captain = int(state["allies_captain_user_id"]) if state["allies_captain_user_id"] else None
+		axis_captain = int(state["axis_captain_user_id"]) if state["axis_captain_user_id"] else None
+		if allies_captain is None or axis_captain is None:
+			await interaction.followup.send("Draft state is incomplete. Restart with `/draft start`.", ephemeral=True)
+			return
+
+		caller_id = int(interaction.user.id)
+		if caller_id not in {allies_captain, axis_captain}:
+			await interaction.followup.send("Only captains can use `/draft ban`.", ephemeral=True)
+			return
+
+		existing_ban = await db.get_draft_player_ban_by_captain(game_id, caller_id)
+		if existing_ban is not None:
+			await interaction.followup.send("You already used your ban for this draft.", ephemeral=True)
+			return
+
+		target_assignment = await db.get_draft_team_assignment(game_id, player.id)
+		if target_assignment is None:
+			await interaction.followup.send("That player is not drafted to a side yet.", ephemeral=True)
+			return
+
+		caller_side = "allies" if caller_id == allies_captain else "axis"
+		target_side = str(target_assignment["team_side"])
+		if target_side == caller_side:
+			await interaction.followup.send("You can only ban players from the opposing side.", ephemeral=True)
+			return
+
+		resolved_nation = await db.resolve_nation_name(game_id, nation)
+		if resolved_nation is None:
+			await interaction.followup.send("Nation not found in draft nation pool.", ephemeral=True)
+			return
+
+		nation_tag = self._nation_tag(resolved_nation)
+		inserted = await db.add_draft_player_ban(game_id, caller_id, player.id, nation_tag)
+		if not inserted:
+			await interaction.followup.send(
+				"Could not save ban. Either you already used your ban or this exact player/nation ban already exists.",
+				ephemeral=True,
+			)
+			return
 
 		await self._refresh_sheet_message(game_id)
 		await interaction.followup.send(
-			f"{interaction.user.mention} picked {player.mention} for **{acting_side.title()}**.",
+			f"Ban locked: {interaction.user.mention} banned {player.mention} from **{nation_tag}** (incl. co-op).",
 		)
 
-	@app_commands.command(name="draft_assign", description="Captain assigns one of their players to a nation")
+	@draft_ban_slash.autocomplete("nation")
+	async def draft_ban_nation_autocomplete(
+		self,
+		interaction: discord.Interaction,
+		current: str,
+	) -> list[app_commands.Choice[str]]:
+		return await self._available_nation_autocomplete(interaction, current)
+
+	@draft.command(name="begin_assignments", description="Move from bans to nation assignments")
+	async def draft_begin_assignments_slash(self, interaction: discord.Interaction) -> None:
+		if not await self._safe_defer(interaction):
+			return
+
+		_, game_id, game = await self._get_draft_game_in_thread(interaction)
+		if game_id is None or game is None:
+			return
+
+		state = await db.get_draft_state(game_id)
+		if state is None or str(state["phase"]) != "ban_pending":
+			await interaction.followup.send("Draft is not in ban phase.", ephemeral=True)
+			return
+
+		allies_captain = int(state["allies_captain_user_id"]) if state["allies_captain_user_id"] else None
+		axis_captain = int(state["axis_captain_user_id"]) if state["axis_captain_user_id"] else None
+		if allies_captain is None or axis_captain is None:
+			await interaction.followup.send("Draft state is incomplete. Restart with `/draft start`.", ephemeral=True)
+			return
+
+		is_host = int(game["host_discord_id"]) == int(interaction.user.id)
+		has_access = await interaction_user_has_bot_access(interaction)
+		is_captain = int(interaction.user.id) in {allies_captain, axis_captain}
+		if not (is_host or has_access or is_captain):
+			await interaction.followup.send("Only host, bot staff, or captains can start assignments.", ephemeral=True)
+			return
+
+		bans = await db.list_draft_player_bans(game_id)
+		captains_with_bans = {int(row["captain_user_id"]) for row in bans}
+		if allies_captain not in captains_with_bans or axis_captain not in captains_with_bans:
+			await interaction.followup.send("Both captains must use `/draft ban` before assignments can begin.", ephemeral=True)
+			return
+
+		await db.update_draft_state(game_id, phase="assigning", next_picker_user_id=0)
+		await self._refresh_sheet_message(game_id)
+		await interaction.followup.send(
+			"Assignment phase started. Captains can now use `/draft assign` for their own side.",
+		)
+
+	@draft.command(name="assign", description="Assign one player on your side to a nation")
 	@app_commands.describe(player="Player on your side", nation="Nation to assign")
 	async def draft_assign_slash(
 		self,
@@ -1046,93 +1244,108 @@ class ReservationsCog(commands.Cog):
 		if not await self._safe_defer(interaction):
 			return
 
-		if not isinstance(interaction.channel, discord.Thread):
-			await interaction.followup.send("Use `/draft_assign` in the game thread.", ephemeral=True)
+		_, game_id, _ = await self._get_draft_game_in_thread(interaction)
+		if game_id is None:
 			return
 
-		game = await db.get_game_by_thread_id(interaction.channel.id)
-		if game is None:
-			await interaction.followup.send("This thread is not linked to an active game.", ephemeral=True)
-			return
-
-		if str(game["preset"]) != "no_sheet":
-			await interaction.followup.send("This game does not use captain draft mode.", ephemeral=True)
-			return
-
-		game_id = int(game["id"])
 		state = await db.get_draft_state(game_id)
-		if state is None:
-			await interaction.followup.send("Draft has not been started yet.", ephemeral=True)
+		if state is None or str(state["phase"]) != "assigning":
+			await interaction.followup.send("Draft is not in assignment phase.", ephemeral=True)
 			return
 
-		captain_side: str | None = None
-		if int(interaction.user.id) == int(state["allies_captain_id"]):
-			captain_side = "allies"
-		elif int(interaction.user.id) == int(state["axis_captain_id"]):
-			captain_side = "axis"
+		allies_captain = int(state["allies_captain_user_id"]) if state["allies_captain_user_id"] else None
+		axis_captain = int(state["axis_captain_user_id"]) if state["axis_captain_user_id"] else None
+		if allies_captain is None or axis_captain is None:
+			await interaction.followup.send("Draft state is incomplete. Restart with `/draft start`.", ephemeral=True)
+			return
 
-		if captain_side is None:
+		captain_id = int(interaction.user.id)
+		if captain_id not in {allies_captain, axis_captain}:
 			await interaction.followup.send("Only captains can assign nations.", ephemeral=True)
 			return
 
-		target = await db.get_draft_player(game_id, player.id)
-		if target is None or str(target["side"]) != captain_side:
-			await interaction.followup.send("You can only assign players that are on your side.", ephemeral=True)
+		captain_side = "allies" if captain_id == allies_captain else "axis"
+		target_assignment = await db.get_draft_team_assignment(game_id, player.id)
+		if target_assignment is None:
+			await interaction.followup.send("That player is not on a drafted team.", ephemeral=True)
+			return
+
+		if str(target_assignment["team_side"]) != captain_side:
+			await interaction.followup.send("You can only assign players on your own side.", ephemeral=True)
 			return
 
 		resolved_nation = await db.resolve_nation_name(game_id, nation)
-		coop_pick = re.match(r"^([A-Za-z]+)\s*(?:\(\s*)?co\s*-?\s*op(?:\s*\))?$", nation.strip(), flags=re.IGNORECASE)
-		if coop_pick:
-			major_tag = coop_pick.group(1).upper()
-			resolved_nation = await db.get_first_available_coop_slot(game_id, major_tag)
-
 		if resolved_nation is None:
-			available = await db.list_available_nations(game_id)
-			preview = "\n".join(f"- {nation_name}" for nation_name in available[:20]) or "- none"
-			await interaction.followup.send(
-				"Nation not found or not available. Available nations right now:\n" + preview,
-				ephemeral=True,
-			)
+			await interaction.followup.send("Nation not found in the draft nation pool.", ephemeral=True)
 			return
 
-		if bool(game["majors_locked"]) and db.is_major_non_coop_nation(resolved_nation):
-			role_id = await db.get_major_lock_role(int(game["guild_id"]))
-			if role_id:
-				has_role = any(role.id == role_id for role in player.roles)
-				if not has_role:
-					role_obj = interaction.guild.get_role(role_id) if interaction.guild else None
-					role_label = role_obj.mention if role_obj else f"role ID {role_id}"
-					await interaction.followup.send(
-						f"{player.mention} needs {role_label} to be assigned major main slots.",
-						ephemeral=True,
-					)
-					return
-
-		reservation = await db.get_nation_reservation(game_id, resolved_nation)
-		if reservation is None:
-			await interaction.followup.send("Nation not found in reservation sheet.", ephemeral=True)
+		nation_row = await db.get_nation_reservation(game_id, resolved_nation)
+		if nation_row is None:
+			await interaction.followup.send("Nation not found in sheet.", ephemeral=True)
 			return
 
-		if reservation["reserved_by"] is not None and int(reservation["reserved_by"]) != int(player.id):
-			await interaction.followup.send(
-				f"{resolved_nation} is already assigned to <@{int(reservation['reserved_by'])}>.",
-				ephemeral=True,
-			)
+		reserved_by = int(nation_row["reserved_by"]) if nation_row["reserved_by"] is not None else None
+		if reserved_by is not None and reserved_by != int(player.id):
+			await interaction.followup.send("That nation is already assigned to another player.", ephemeral=True)
 			return
 
-		current = await db.get_user_reserved_nations(game_id, player.id)
-		for row in current:
-			await db.admin_clear_reservation(game_id, str(row["nation_name"]))
+		nation_tag = self._nation_tag(resolved_nation)
+		bans = await db.list_draft_player_bans(game_id)
+		for row in bans:
+			if int(row["target_user_id"]) == int(player.id) and str(row["nation_tag"]).upper() == nation_tag:
+				await interaction.followup.send(
+					f"{player.mention} is banned from **{nation_tag}** (including co-op slots).",
+					ephemeral=True,
+				)
+				return
 
-		updated = await db.admin_set_reservation(game_id, resolved_nation, player.id, player.display_name)
-		if not updated:
+		current_reserved = await db.get_user_reserved_nations(game_id, player.id)
+		if len(current_reserved) > 1:
+			await interaction.followup.send("That player has multiple assigned nations. Ask staff to clean the sheet.", ephemeral=True)
+			return
+
+		old_nation = str(current_reserved[0]["nation_name"]) if current_reserved else None
+		if old_nation is not None and old_nation.lower() == resolved_nation.lower():
+			await interaction.followup.send(f"{player.mention} is already assigned to **{resolved_nation}**.", ephemeral=True)
+			return
+
+		if old_nation is not None:
+			await db.unreserve_nation(game_id, old_nation)
+
+		assigned = await db.reserve_nation(
+			game_id=game_id,
+			nation_name=resolved_nation,
+			user_id=player.id,
+			user_name=player.display_name,
+		)
+		if not assigned:
+			if old_nation is not None:
+				await db.reserve_nation(game_id, old_nation, player.id, player.display_name)
 			await interaction.followup.send("Could not assign nation. Try again.", ephemeral=True)
 			return
 
+		team_rows = await db.list_draft_team_assignments(game_id)
+		team_user_ids = {int(row["user_id"]) for row in team_rows}
+		sheet_rows = await db.list_sheet(game_id)
+		assigned_user_ids = {
+			int(row["reserved_by"])
+			for row in sheet_rows
+			if row["reserved_by"] is not None and int(row["reserved_by"]) in team_user_ids
+		}
+		is_complete = bool(team_user_ids) and team_user_ids.issubset(assigned_user_ids)
+
+		if is_complete:
+			await db.update_draft_state(game_id, phase="complete", next_picker_user_id=0)
+
 		await self._refresh_sheet_message(game_id)
+		if is_complete:
+			await interaction.followup.send(
+				f"Assignment locked: {player.mention} -> **{resolved_nation}**. Draft complete.",
+			)
+			return
+
 		await interaction.followup.send(
-			f"Assigned {player.mention} to **{resolved_nation}**.",
-			ephemeral=True,
+			f"Assignment locked: {player.mention} -> **{resolved_nation}**.",
 		)
 
 	@draft_assign_slash.autocomplete("nation")
@@ -1142,6 +1355,138 @@ class ReservationsCog(commands.Cog):
 		current: str,
 	) -> list[app_commands.Choice[str]]:
 		return await self._available_nation_autocomplete(interaction, current)
+
+
+
+	@app_commands.command(name="draft_preferences", description="Set up to 5 preferred nations for no-sheet draft")
+	@app_commands.describe(
+		top1="First choice",
+		top2="Second choice (optional)",
+		top3="Third choice (optional)",
+		top4="Fourth choice (optional)",
+		top5="Fifth choice (optional)",
+	)
+	async def draft_preferences_slash(
+		self,
+		interaction: discord.Interaction,
+		top1: str,
+		top2: str | None = None,
+		top3: str | None = None,
+		top4: str | None = None,
+		top5: str | None = None,
+	) -> None:
+		if not await self._safe_defer(interaction):
+			return
+
+		_, game_id, _ = await self._get_draft_game_in_thread(interaction)
+		if game_id is None:
+			return
+
+		reservation = await db.get_draft_reservation(game_id, interaction.user.id)
+		if reservation is None:
+			await interaction.followup.send("Join the draft first with `/draft reserve`.", ephemeral=True)
+			return
+
+		raw_choices = [top1, top2, top3, top4, top5]
+		choices = [choice.strip() for choice in raw_choices if choice and choice.strip()]
+		if not choices:
+			await interaction.followup.send("Provide at least one nation preference.", ephemeral=True)
+			return
+
+		normalized_seen: set[str] = set()
+		for choice in choices:
+			normalized = choice.lower()
+			if normalized in normalized_seen:
+				await interaction.followup.send("Please avoid duplicate nation choices.", ephemeral=True)
+				return
+			normalized_seen.add(normalized)
+
+		valid_choice_map = {choice.lower(): choice for choice in self._preferences_country_list()}
+		canonical_choices: list[str] = []
+		for choice in choices:
+			canonical = valid_choice_map.get(choice.lower())
+			if canonical is None:
+				await interaction.followup.send(
+					f"`{choice}` is not a valid draft nation preference.",
+					ephemeral=True,
+				)
+				return
+			canonical_choices.append(canonical)
+
+		is_late_player = str(reservation["slot_type"]) == "late_hotjoin"
+		if is_late_player:
+			invalid = [choice for choice in canonical_choices if not self._is_late_allowed_preference(choice)]
+			if invalid:
+				await interaction.followup.send(
+					"Late players can only choose co-op preferences and VICHY.",
+					ephemeral=True,
+				)
+				return
+
+		await db.set_game_preferences(
+			game_id=game_id,
+			user_id=interaction.user.id,
+			user_name=interaction.user.display_name,
+			choices=canonical_choices,
+		)
+		await self._refresh_sheet_message(game_id)
+
+		formatted = [self._format_preference_choice(choice) for choice in canonical_choices]
+		await interaction.followup.send(
+			"Saved draft preferences: " + ", ".join(formatted),
+			ephemeral=True,
+		)
+
+	@draft_preferences_slash.autocomplete("top1")
+	@draft_preferences_slash.autocomplete("top2")
+	@draft_preferences_slash.autocomplete("top3")
+	@draft_preferences_slash.autocomplete("top4")
+	@draft_preferences_slash.autocomplete("top5")
+	async def draft_preferences_country_autocomplete(
+		self,
+		interaction: discord.Interaction,
+		current: str,
+	) -> list[app_commands.Choice[str]]:
+		return await self._preferences_autocomplete(interaction, current)
+
+
+	@app_commands.command(name="preferences", description="Deprecated alias for /draft_preferences")
+	@app_commands.describe(
+		top1="First choice",
+		top2="Second choice (optional)",
+		top3="Third choice (optional)",
+		top4="Fourth choice (optional)",
+		top5="Fifth choice (optional)",
+	)
+	async def preferences_slash(
+		self,
+		interaction: discord.Interaction,
+		top1: str,
+		top2: str | None = None,
+		top3: str | None = None,
+		top4: str | None = None,
+		top5: str | None = None,
+	) -> None:
+		await self.draft_preferences_slash(
+			interaction,
+			top1,
+			top2,
+			top3,
+			top4,
+			top5,
+		)
+
+	@preferences_slash.autocomplete("top1")
+	@preferences_slash.autocomplete("top2")
+	@preferences_slash.autocomplete("top3")
+	@preferences_slash.autocomplete("top4")
+	@preferences_slash.autocomplete("top5")
+	async def preferences_country_autocomplete(
+		self,
+		interaction: discord.Interaction,
+		current: str,
+	) -> list[app_commands.Choice[str]]:
+		return await self._preferences_autocomplete(interaction, current)
 
 
 async def setup(bot: commands.Bot) -> None:
