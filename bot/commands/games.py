@@ -119,7 +119,7 @@ class GamesCog(commands.Cog):
 		if preset != "no_sheet":
 			lines.append("**Reserve:** Use `/reserve` and `/unreserve` in this thread.")
 		else:
-			lines.append("**Draft:** Use `/draft_join`, `/draft_vote`, `/draft_start`, `/draft_decide`, `/draft_pick`, and `/draft_assign` in this thread.")
+			lines.append("**Draft:** Use `/draft_join`, `/draft_vote`, `/draft_start`, `/draft_decide`, `/draft_pick`, `/draft_ban`, and `/draft_assign` in this thread.")
 		return "\n".join(lines)
 
 	def _build_announcement_message_content(
@@ -631,7 +631,7 @@ class GamesCog(commands.Cog):
 						"",
 						*sheet_lines,
 						"",
-						"Use `/draft_join` to enter pool with role/captain options, `/draft_vote` to vote captains, `/draft_start` to begin, `/draft_decide` for captain decision, `/draft_pick` for picks, and `/draft_assign` for nation assignment.",
+						"Use `/draft_join` to enter pool with role/captain options, `/draft_vote` to vote captains (up to 2), `/draft_start` to begin, `/draft_decide` for captain decision, `/draft_pick` for picks, `/draft_ban` for bans, and `/draft_assign` for nation assignment.",
 					]
 					pref_message = await thread.send("\n".join(pref_lines))
 					try:

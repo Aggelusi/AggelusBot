@@ -77,6 +77,8 @@ _FACTION_BY_TAG = {
 	"SIA": "GEACPS",
 }
 
+_DRAFT_SIDES = {"allies", "axis"}
+
 
 def build_nation_pool(coop_overrides: dict[str, int] | None = None) -> list[str]:
 	"""Build the reservation nation list with configurable co-op slots."""
@@ -430,6 +432,51 @@ async def init_schema() -> None:
 	)
 	await execute(
 		"ALTER TABLE game_draft_state ADD COLUMN IF NOT EXISTS first_pick_captain_id BIGINT"
+	)
+
+	# v2 votes table: allows up to 2 captain votes per voter.
+	await execute(
+		"""
+		CREATE TABLE IF NOT EXISTS game_draft_votes_v2 (
+			id SERIAL PRIMARY KEY,
+			game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+			voter_id BIGINT NOT NULL,
+			voter_name TEXT NOT NULL,
+			candidate_user_id BIGINT NOT NULL,
+			vote_slot SMALLINT NOT NULL CHECK (vote_slot IN (1, 2)),
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (game_id, voter_id, vote_slot),
+			UNIQUE (game_id, voter_id, candidate_user_id),
+			FOREIGN KEY (game_id, candidate_user_id)
+				REFERENCES game_draft_players (game_id, user_id)
+				ON DELETE CASCADE
+		)
+		"""
+	)
+	await execute(
+		"""
+		INSERT INTO game_draft_votes_v2 (game_id, voter_id, voter_name, candidate_user_id, vote_slot)
+		SELECT v.game_id, v.voter_id, v.voter_name, v.candidate_user_id, 1
+		FROM game_draft_votes v
+		ON CONFLICT (game_id, voter_id, vote_slot) DO NOTHING
+		"""
+	)
+
+	await execute(
+		"""
+		CREATE TABLE IF NOT EXISTS game_draft_bans (
+			id SERIAL PRIMARY KEY,
+			game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+			side TEXT NOT NULL,
+			banned_player_id BIGINT NOT NULL,
+			banned_player_name TEXT NOT NULL,
+			banned_nation_tag TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (game_id, side)
+		)
+		"""
 	)
 
 	await execute(
@@ -928,6 +975,12 @@ async def get_first_available_coop_slot(game_id: int, major_tag: str) -> str | N
 	)
 
 
+def nation_tag_from_name(nation_name: str) -> str:
+	"""Extract canonical nation tag (first token) from nation label."""
+	base = nation_name.split(" (Co-op", 1)[0]
+	return base.split()[0].upper()
+
+
 async def resolve_nation_name(game_id: int, user_input: str) -> str | None:
 	"""Resolve user nation input to canonical nation label in this game sheet."""
 	rows = await fetch(
@@ -1219,6 +1272,14 @@ async def initialize_draft_captain_decision(
 	async with pool.acquire() as conn:
 		async with conn.transaction():
 			await conn.execute(
+				"DELETE FROM game_draft_bans WHERE game_id = $1",
+				game_id,
+			)
+			await conn.execute(
+				"DELETE FROM game_draft_votes_v2 WHERE game_id = $1",
+				game_id,
+			)
+			await conn.execute(
 				"""
 				UPDATE game_draft_players
 				SET side = 'unpicked', is_captain = FALSE, picked_at = NULL, updated_at = NOW()
@@ -1373,7 +1434,25 @@ async def finalize_draft_sides(
 
 
 async def set_captain_vote(game_id: int, voter_id: int, voter_name: str, candidate_user_id: int) -> bool:
-	"""Set one captain vote per voter. Returns False if candidate is not eligible."""
+	"""Legacy wrapper: keep compatibility with older callers."""
+	action, _ = await toggle_captain_vote(game_id, voter_id, voter_name, candidate_user_id)
+	return action in {"added", "removed"}
+
+
+async def toggle_captain_vote(
+	game_id: int,
+	voter_id: int,
+	voter_name: str,
+	candidate_user_id: int,
+) -> tuple[str, int]:
+	"""Toggle a captain vote for one candidate.
+
+	Returns:
+	- ("added", vote_count): vote added (max 2 total votes per voter)
+	- ("removed", vote_count): existing vote removed
+	- ("limit", vote_count): voter already has 2 votes and tried adding a third
+	- ("ineligible", vote_count): candidate is not eligible captain
+	"""
 	eligible = await fetchval(
 		"""
 		SELECT 1
@@ -1384,24 +1463,75 @@ async def set_captain_vote(game_id: int, voter_id: int, voter_name: str, candida
 		candidate_user_id,
 	)
 	if not eligible:
-		return False
+		vote_count = await count_voter_captain_votes(game_id, voter_id)
+		return "ineligible", vote_count
+
+	existing_vote_id = await fetchval(
+		"""
+		SELECT id
+		FROM game_draft_votes_v2
+		WHERE game_id = $1 AND voter_id = $2 AND candidate_user_id = $3
+		""",
+		game_id,
+		voter_id,
+		candidate_user_id,
+	)
+	if existing_vote_id is not None:
+		await execute(
+			"DELETE FROM game_draft_votes_v2 WHERE id = $1",
+			int(existing_vote_id),
+		)
+		vote_count = await count_voter_captain_votes(game_id, voter_id)
+		return "removed", vote_count
+
+	vote_count = await count_voter_captain_votes(game_id, voter_id)
+	if vote_count >= 2:
+		return "limit", vote_count
+
+	used_slots = await fetch(
+		"""
+		SELECT vote_slot
+		FROM game_draft_votes_v2
+		WHERE game_id = $1 AND voter_id = $2
+		ORDER BY vote_slot ASC
+		""",
+		game_id,
+		voter_id,
+	)
+	used = {int(row["vote_slot"]) for row in used_slots}
+	next_slot = 1 if 1 not in used else 2
 
 	await execute(
 		"""
-		INSERT INTO game_draft_votes (game_id, voter_id, voter_name, candidate_user_id)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (game_id, voter_id)
+		INSERT INTO game_draft_votes_v2 (game_id, voter_id, voter_name, candidate_user_id, vote_slot)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (game_id, voter_id, candidate_user_id)
 		DO UPDATE SET
-			candidate_user_id = EXCLUDED.candidate_user_id,
 			voter_name = EXCLUDED.voter_name,
+			vote_slot = EXCLUDED.vote_slot,
 			updated_at = NOW()
 		""",
 		game_id,
 		voter_id,
 		voter_name,
 		candidate_user_id,
+		next_slot,
 	)
-	return True
+	vote_count = await count_voter_captain_votes(game_id, voter_id)
+	return "added", vote_count
+
+
+async def count_voter_captain_votes(game_id: int, voter_id: int) -> int:
+	value = await fetchval(
+		"""
+		SELECT COUNT(*)
+		FROM game_draft_votes_v2
+		WHERE game_id = $1 AND voter_id = $2
+		""",
+		game_id,
+		voter_id,
+	)
+	return int(value or 0)
 
 
 async def list_captain_candidates_with_votes(game_id: int) -> list[asyncpg.Record]:
@@ -1417,7 +1547,7 @@ async def list_captain_candidates_with_votes(game_id: int) -> list[asyncpg.Recor
 			p.updated_at,
 			COUNT(v.id)::INT AS vote_count
 		FROM game_draft_players p
-		LEFT JOIN game_draft_votes v
+		LEFT JOIN game_draft_votes_v2 v
 			ON v.game_id = p.game_id AND v.candidate_user_id = p.user_id
 		WHERE p.game_id = $1 AND p.up_for_captain = TRUE
 		GROUP BY p.user_id, p.user_name, p.role_preference, p.up_for_captain, p.side, p.is_captain, p.updated_at
@@ -1425,6 +1555,73 @@ async def list_captain_candidates_with_votes(game_id: int) -> list[asyncpg.Recor
 		""",
 		game_id,
 	)
+
+
+async def list_draft_bans(game_id: int) -> list[asyncpg.Record]:
+	return await fetch(
+		"""
+		SELECT side, banned_player_id, banned_player_name, banned_nation_tag, created_at, updated_at
+		FROM game_draft_bans
+		WHERE game_id = $1
+		ORDER BY side ASC
+		""",
+		game_id,
+	)
+
+
+async def get_draft_ban_for_side(game_id: int, side: str) -> asyncpg.Record | None:
+	if side not in _DRAFT_SIDES:
+		return None
+	return await fetchrow(
+		"""
+		SELECT side, banned_player_id, banned_player_name, banned_nation_tag, created_at, updated_at
+		FROM game_draft_bans
+		WHERE game_id = $1 AND side = $2
+		""",
+		game_id,
+		side,
+	)
+
+
+async def set_draft_ban(
+	game_id: int,
+	side: str,
+	banned_player_id: int,
+	banned_player_name: str,
+	banned_nation_tag: str,
+) -> bool:
+	if side not in _DRAFT_SIDES:
+		return False
+
+	result = await execute(
+		"""
+		INSERT INTO game_draft_bans (game_id, side, banned_player_id, banned_player_name, banned_nation_tag)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (game_id, side)
+		DO NOTHING
+		""",
+		game_id,
+		side,
+		banned_player_id,
+		banned_player_name,
+		banned_nation_tag.upper(),
+	)
+	return _status_affected_rows(result) == 1
+
+
+async def is_player_banned_from_nation(game_id: int, player_id: int, nation_name: str) -> bool:
+	nation_tag = nation_tag_from_name(nation_name)
+	ban_exists = await fetchval(
+		"""
+		SELECT 1
+		FROM game_draft_bans
+		WHERE game_id = $1 AND banned_player_id = $2 AND banned_nation_tag = $3
+		""",
+		game_id,
+		player_id,
+		nation_tag,
+	)
+	return bool(ban_exists)
 
 
 async def get_top_captain_candidates(game_id: int, limit: int = 2) -> list[asyncpg.Record]:

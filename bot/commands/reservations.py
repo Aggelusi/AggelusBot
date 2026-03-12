@@ -58,6 +58,7 @@ class ReservationsCog(commands.Cog):
 			"draft_vote",
 			"draft_decide",
 			"draft_pick",
+			"draft_ban",
 			"draft_assign",
 		}
 
@@ -209,6 +210,7 @@ class ReservationsCog(commands.Cog):
 		if str(game["preset"]) == "no_sheet":
 			draft_state = await db.get_draft_state(game_id)
 			players = await db.list_draft_players(game_id)
+			draft_bans = await db.list_draft_bans(game_id)
 			candidate_rows = await db.list_captain_candidates_with_votes(game_id)
 			vote_map = {int(row["user_id"]): int(row["vote_count"]) for row in candidate_rows}
 			captain_pool = [row for row in players if str(row["side"]) == "captain"]
@@ -266,12 +268,29 @@ class ReservationsCog(commands.Cog):
 						"Captain decision: "
 						f"<@{int(draft_state['pending_side_choice_captain_id'])}> chooses team side via `/draft_decide`."
 					)
+				elif state_status == "banning" and next_turn in {"allies", "axis"}:
+					captain_id = draft_state["allies_captain_id"] if next_turn == "allies" else draft_state["axis_captain_id"]
+					if captain_id:
+						turn_line = f"Ban turn: <@{int(captain_id)}> uses `/draft_ban`."
+					else:
+						turn_line = "Ban turn: captain not set"
 				elif next_turn == "allies" and draft_state["allies_captain_id"]:
 					turn_line = f"Next pick: <@{int(draft_state['allies_captain_id'])}>"
 				elif next_turn == "axis" and draft_state["axis_captain_id"]:
 					turn_line = f"Next pick: <@{int(draft_state['axis_captain_id'])}>"
 				else:
 					turn_line = "Next pick: not set"
+
+			ban_lines: list[str] = []
+			ban_by_side = {str(row["side"]): row for row in draft_bans}
+			for side_name in ("allies", "axis"):
+				row = ban_by_side.get(side_name)
+				if row is None:
+					ban_lines.append(f"- {side_name.title()}: none")
+					continue
+				ban_lines.append(
+					f"- {side_name.title()}: <@{int(row['banned_player_id'])}> banned from **{str(row['banned_nation_tag']).upper()}**"
+				)
 
 			lines = [
 				f"## Draft Board — {game['title']}",
@@ -290,6 +309,9 @@ class ReservationsCog(commands.Cog):
 				"",
 				"### Axis",
 				*_render_side_rows(axis, side_list_mode=True),
+				"",
+				"### Bans",
+				*ban_lines,
 			]
 
 			sheet_rows = await db.list_sheet(game_id)
@@ -298,7 +320,7 @@ class ReservationsCog(commands.Cog):
 			lines.extend(
 				[
 					"",
-					"Use `/draft_join` to enter pool with role/captain options, `/draft_vote` to vote captains, `/draft_start` to begin, `/draft_decide` for captain decision, `/draft_pick` for picks, and `/draft_assign` for nation assignment.",
+					"Use `/draft_join` to enter pool with role/captain options, `/draft_vote` to vote captains (up to 2), `/draft_start` to begin, `/draft_decide` for captain decision, `/draft_pick` for picks, `/draft_ban` for bans, and `/draft_assign` for nation assignment.",
 				]
 			)
 		else:
@@ -475,7 +497,7 @@ class ReservationsCog(commands.Cog):
 		game_id = int(game["id"])
 		if str(game["preset"]) == "no_sheet":
 			await interaction.followup.send(
-				"This game uses captain draft mode. Use `/draft_join`, `/draft_vote`, `/draft_start`, `/draft_decide`, `/draft_pick`, and `/draft_assign`.",
+				"This game uses captain draft mode. Use `/draft_join`, `/draft_vote`, `/draft_start`, `/draft_decide`, `/draft_pick`, `/draft_ban`, and `/draft_assign`.",
 				ephemeral=True,
 			)
 			return
@@ -766,13 +788,33 @@ class ReservationsCog(commands.Cog):
 			await interaction.followup.send("That player is not up for captain.", ephemeral=True)
 			return
 
-		ok = await db.set_captain_vote(game_id, interaction.user.id, interaction.user.display_name, candidate.id)
-		if not ok:
+		action, vote_count = await db.toggle_captain_vote(
+			game_id,
+			interaction.user.id,
+			interaction.user.display_name,
+			candidate.id,
+		)
+		if action == "ineligible":
 			await interaction.followup.send("Could not save vote. Candidate may no longer be eligible.", ephemeral=True)
+			return
+		if action == "limit":
+			await interaction.followup.send(
+				"You already used both captain votes. Remove one by running `/draft_vote` on someone you already voted for.",
+				ephemeral=True,
+			)
 			return
 
 		await self._refresh_sheet_message(game_id)
-		await interaction.followup.send(f"Your vote was saved for {candidate.mention}.", ephemeral=True)
+		if action == "removed":
+			await interaction.followup.send(
+				f"Vote removed for {candidate.mention}. You now have **{vote_count}/2** votes used.",
+				ephemeral=True,
+			)
+		else:
+			await interaction.followup.send(
+				f"Vote saved for {candidate.mention}. You now have **{vote_count}/2** votes used.",
+				ephemeral=True,
+			)
 
 	@app_commands.command(name="draft_start", description="Start captain draft using top 2 voted candidates")
 	async def draft_start_slash(
@@ -1026,13 +1068,116 @@ class ReservationsCog(commands.Cog):
 
 		remaining = await db.count_unpicked_draft_players(game_id)
 		if remaining == 0:
-			await db.set_draft_status(game_id, "assigning")
+			next_ban_side = "allies"
+			if state["first_pick_captain_id"]:
+				first_pick_captain_id = int(state["first_pick_captain_id"])
+				if state["axis_captain_id"] and first_pick_captain_id == int(state["axis_captain_id"]):
+					next_ban_side = "axis"
+			await db.set_draft_status(game_id, "banning")
+			await db.set_draft_next_turn(game_id, next_ban_side)
 		else:
 			await db.set_draft_next_turn(game_id, "axis" if acting_side == "allies" else "allies")
 
 		await self._refresh_sheet_message(game_id)
 		await interaction.followup.send(
 			f"{interaction.user.mention} picked {player.mention} for **{acting_side.title()}**.",
+		)
+
+	@app_commands.command(name="draft_ban", description="Captain bans one opposing player from one nation tag")
+	@app_commands.describe(
+		player="Opposing side player to ban from a nation",
+		nation="Nation (tag or name), e.g. GER or Germany",
+	)
+	async def draft_ban_slash(
+		self,
+		interaction: discord.Interaction,
+		player: discord.Member,
+		nation: str,
+	) -> None:
+		if not await self._safe_defer(interaction):
+			return
+
+		if not isinstance(interaction.channel, discord.Thread):
+			await interaction.followup.send("Use `/draft_ban` in the game thread.", ephemeral=True)
+			return
+
+		game = await db.get_game_by_thread_id(interaction.channel.id)
+		if game is None:
+			await interaction.followup.send("This thread is not linked to an active game.", ephemeral=True)
+			return
+
+		if str(game["preset"]) != "no_sheet":
+			await interaction.followup.send("This game does not use captain draft mode.", ephemeral=True)
+			return
+
+		game_id = int(game["id"])
+		state = await db.get_draft_state(game_id)
+		if state is None or str(state["status"]) != "banning":
+			await interaction.followup.send("Draft is not currently in banning stage.", ephemeral=True)
+			return
+
+		captain_side: str | None = None
+		if state["allies_captain_id"] and int(interaction.user.id) == int(state["allies_captain_id"]):
+			captain_side = "allies"
+		elif state["axis_captain_id"] and int(interaction.user.id) == int(state["axis_captain_id"]):
+			captain_side = "axis"
+
+		if captain_side is None:
+			await interaction.followup.send("Only captains can issue bans.", ephemeral=True)
+			return
+
+		next_turn = str(state["next_turn"])
+		if next_turn != captain_side:
+			await interaction.followup.send("It is not your turn to ban.", ephemeral=True)
+			return
+
+		existing_ban = await db.get_draft_ban_for_side(game_id, captain_side)
+		if existing_ban is not None:
+			await interaction.followup.send("Your side has already used its ban.", ephemeral=True)
+			return
+
+		target = await db.get_draft_player(game_id, player.id)
+		if target is None:
+			await interaction.followup.send("That user is not in the draft pool.", ephemeral=True)
+			return
+
+		target_side = str(target["side"])
+		if target_side == captain_side:
+			await interaction.followup.send("You must ban a player from the opposing side.", ephemeral=True)
+			return
+
+		if target_side not in {"allies", "axis"}:
+			await interaction.followup.send("You can only ban players that have already been drafted to a side.", ephemeral=True)
+			return
+
+		resolved_nation = await db.resolve_nation_name(game_id, nation)
+		if resolved_nation is None:
+			await interaction.followup.send("Nation not found in this game sheet.", ephemeral=True)
+			return
+
+		nation_tag = db.nation_tag_from_name(resolved_nation)
+		created = await db.set_draft_ban(
+			game_id=game_id,
+			side=captain_side,
+			banned_player_id=player.id,
+			banned_player_name=player.display_name,
+			banned_nation_tag=nation_tag,
+		)
+		if not created:
+			await interaction.followup.send("Could not apply ban. Try again.", ephemeral=True)
+			return
+
+		other_side = "axis" if captain_side == "allies" else "allies"
+		other_done = await db.get_draft_ban_for_side(game_id, other_side)
+		if other_done is None:
+			await db.set_draft_next_turn(game_id, other_side)
+		else:
+			await db.set_draft_status(game_id, "assigning")
+			await db.set_draft_next_turn(game_id, "none")
+
+		await self._refresh_sheet_message(game_id)
+		await interaction.followup.send(
+			f"{interaction.user.mention} banned {player.mention} from **{nation_tag}** (main and co-op).",
 		)
 
 	@app_commands.command(name="draft_assign", description="Captain assigns one of their players to a nation")
@@ -1064,6 +1209,9 @@ class ReservationsCog(commands.Cog):
 		if state is None:
 			await interaction.followup.send("Draft has not been started yet.", ephemeral=True)
 			return
+		if str(state["status"]) != "assigning":
+			await interaction.followup.send("Draft assignments are locked until picks and bans are complete.", ephemeral=True)
+			return
 
 		captain_side: str | None = None
 		if int(interaction.user.id) == int(state["allies_captain_id"]):
@@ -1091,6 +1239,14 @@ class ReservationsCog(commands.Cog):
 			preview = "\n".join(f"- {nation_name}" for nation_name in available[:20]) or "- none"
 			await interaction.followup.send(
 				"Nation not found or not available. Available nations right now:\n" + preview,
+				ephemeral=True,
+			)
+			return
+
+		if await db.is_player_banned_from_nation(game_id, player.id, resolved_nation):
+			tag = db.nation_tag_from_name(resolved_nation)
+			await interaction.followup.send(
+				f"{player.mention} is banned from **{tag}** (main and co-op). Choose a different nation.",
 				ephemeral=True,
 			)
 			return
