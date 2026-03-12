@@ -11,6 +11,10 @@ from bot.config import settings
 from bot.database import db
 
 
+BOOT_RETRY_BASE_SECONDS = 5
+BOOT_RETRY_MAX_SECONDS = 60
+
+
 logging.basicConfig(
 	level=logging.INFO,
 	format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -52,67 +56,89 @@ class HOI4Bot(commands.Bot):
 
 
 async def main() -> None:
-	intents = discord.Intents.default()
-	intents.message_content = True
+	retry_delay = BOOT_RETRY_BASE_SECONDS
 
-	bot = HOI4Bot(command_prefix=settings.command_prefix, intents=intents)
-	cleaned_stale_guild_commands = False
+	while True:
+		intents = discord.Intents.default()
+		intents.message_content = True
 
-	@bot.event
-	async def on_ready() -> None:
-		nonlocal cleaned_stale_guild_commands
+		bot = HOI4Bot(command_prefix=settings.command_prefix, intents=intents)
+		cleaned_stale_guild_commands = False
 
-		# If DEV_GUILD_ID was used in the past, stale guild-scoped command copies
-		# can remain and appear as duplicates beside global commands.
-		# We clear guild scopes once at startup when not in dev-guild mode.
-		if not settings.dev_guild_id and not cleaned_stale_guild_commands:
-			for guild in bot.guilds:
-				bot.tree.clear_commands(guild=guild)
-				await bot.tree.sync(guild=guild)
-				logging.info("Cleared stale guild app commands in guild=%s (%s)", guild.name, guild.id)
-			cleaned_stale_guild_commands = True
+		@bot.event
+		async def on_ready() -> None:
+			nonlocal cleaned_stale_guild_commands
 
-		logging.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
+			# If DEV_GUILD_ID was used in the past, stale guild-scoped command copies
+			# can remain and appear as duplicates beside global commands.
+			# We clear guild scopes once at startup when not in dev-guild mode.
+			if not settings.dev_guild_id and not cleaned_stale_guild_commands:
+				for guild in bot.guilds:
+					bot.tree.clear_commands(guild=guild)
+					await bot.tree.sync(guild=guild)
+					logging.info("Cleared stale guild app commands in guild=%s (%s)", guild.name, guild.id)
+				cleaned_stale_guild_commands = True
 
-	@bot.event
-	async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
-		# Keep expected failures quiet and actionable instead of printing long traces.
-		if isinstance(error, commands.CommandNotFound):
-			return
+			logging.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
 
-		root_error = getattr(error, "original", error)
-		if isinstance(root_error, discord.Forbidden):
-			logging.warning(
-				"Missing permissions for command '%s' in #%s (guild=%s)",
-				ctx.command.qualified_name if ctx.command else "unknown",
-				getattr(ctx.channel, "name", "unknown"),
-				getattr(ctx.guild, "name", "DM"),
-			)
-			return
+		@bot.event
+		async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
+			# Keep expected failures quiet and actionable instead of printing long traces.
+			if isinstance(error, commands.CommandNotFound):
+				return
 
-		logging.exception("Unhandled command error", exc_info=error)
+			root_error = getattr(error, "original", error)
+			if isinstance(root_error, discord.Forbidden):
+				logging.warning(
+					"Missing permissions for command '%s' in #%s (guild=%s)",
+					ctx.command.qualified_name if ctx.command else "unknown",
+					getattr(ctx.channel, "name", "unknown"),
+					getattr(ctx.guild, "name", "DM"),
+				)
+				return
 
-	@bot.tree.error
-	async def on_app_command_error(
-		interaction: discord.Interaction,
-		error: discord.app_commands.AppCommandError,
-	) -> None:
-		logging.exception("Unhandled app command error", exc_info=error)
-		if isinstance(error, discord.app_commands.CommandSignatureMismatch):
-			message = "Command schema is updating. Reload Discord and retry in a few seconds."
-		else:
-			message = "Something went wrong while processing this slash command."
-		try:
-			if interaction.response.is_done():
-				await interaction.followup.send(message, ephemeral=True)
+			logging.exception("Unhandled command error", exc_info=error)
+
+		@bot.tree.error
+		async def on_app_command_error(
+			interaction: discord.Interaction,
+			error: discord.app_commands.AppCommandError,
+		) -> None:
+			logging.exception("Unhandled app command error", exc_info=error)
+			if isinstance(error, discord.app_commands.CommandSignatureMismatch):
+				message = "Command schema is updating. Reload Discord and retry in a few seconds."
 			else:
-				await interaction.response.send_message(message, ephemeral=True)
-		except (discord.HTTPException, discord.NotFound):
-			# Interaction token may already be invalid/acknowledged; avoid noisy loops.
-			pass
+				message = "Something went wrong while processing this slash command."
+			try:
+				if interaction.response.is_done():
+					await interaction.followup.send(message, ephemeral=True)
+				else:
+					await interaction.response.send_message(message, ephemeral=True)
+			except (discord.HTTPException, discord.NotFound):
+				# Interaction token may already be invalid/acknowledged; avoid noisy loops.
+				pass
 
-	await bot.start(settings.discord_token)
+		try:
+			await bot.start(settings.discord_token)
+			return
+		except (discord.HTTPException, OSError) as exc:
+			# Network/API issues are often transient after host or network restarts.
+			logging.exception(
+				"Bot startup/runtime failed (%s). Retrying in %ss.",
+				type(exc).__name__,
+				retry_delay,
+			)
+			await asyncio.sleep(retry_delay)
+			retry_delay = min(retry_delay * 2, BOOT_RETRY_MAX_SECONDS)
+		finally:
+			if not bot.is_closed():
+				await bot.close()
 
 
 if __name__ == "__main__":
-	asyncio.run(main())
+	try:
+		asyncio.run(main())
+	except KeyboardInterrupt:
+		logging.info("Shutdown requested by user (KeyboardInterrupt).")
+	except asyncio.CancelledError:
+		logging.info("Shutdown requested (event loop cancelled).")
